@@ -1,0 +1,12 @@
+# Scratch files
+scratchpad.sql
+Untitled*.sql
+
+# Snowflake workspace internals
+.snowflake/
+
+# Secrets (should never be committed)
+snowflake.json
+datasources.json
+*.pem
+*.key

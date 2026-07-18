@@ -1,0 +1,391 @@
+# Semantic view for WA State EV Registration analytics.
+# Co-authored with CoCo
+#
+# This semantic view defines the business-friendly interface for Cortex Analyst.
+# It covers Gold layer tables (star schema) + CDC incentive data.
+
+name: EV_REGISTRATIONS
+description: >
+  Washington State EV registration analytics covering vehicle registrations,
+  geographic distribution, adoption trends vs. 2030 goals, and incentive program
+  effectiveness. Supports executive, sales/marketing, and operations personas.
+
+database: EV_DEMO
+
+tables:
+  - name: FACT_EV_REGISTRATIONS
+    base_table:
+      database: EV_DEMO
+      schema: MART
+      table: FACT_EV_REGISTRATIONS
+    description: >
+      Core fact table — one row per registered EV vehicle with keys to
+      dimension tables and enrichment from incentive program data.
+    columns:
+      - name: VIN
+        description: Vehicle Identification Number — unique vehicle identifier
+        data_type: VARCHAR
+      - name: GEO_KEY
+        description: Surrogate key linking to DIM_GEOGRAPHY (SHA2 hash of county+city+postal_code)
+        data_type: VARCHAR
+      - name: MODEL_YEAR
+        description: Model year of the vehicle (e.g., 2020, 2024)
+        data_type: NUMBER
+      - name: CAFV_ELIGIBILITY
+        description: Clean Alternative Fuel Vehicle eligibility status
+        data_type: VARCHAR
+      - name: ELECTRIC_UTILITY
+        description: Electric utility provider serving the vehicle's registered address
+        data_type: VARCHAR
+      - name: CENSUS_TRACT
+        description: Census tract identifier for the registration address
+        data_type: VARCHAR
+      - name: TARGET_EV_COUNT
+        description: State policy target for total EVs in the vehicle's model year
+        data_type: NUMBER
+      - name: POLICY_NAME
+        description: Name of the state policy setting the EV target (e.g., Clean Cars 2030)
+        data_type: VARCHAR
+      - name: INCENTIVE_AMOUNT
+        description: Dollar amount of the incentive application matched to this vehicle
+        data_type: NUMBER
+      - name: APPLICATION_STATUS
+        description: Status of the matched incentive application (PENDING, APPROVED, DENIED)
+        data_type: VARCHAR
+      - name: LOAD_TS
+        description: Timestamp when this record was ingested into the pipeline
+        data_type: TIMESTAMP_NTZ
+    measures:
+      - name: registration_count
+        description: Total number of registered vehicles
+        expr: COUNT(VIN)
+      - name: avg_electric_range
+        description: Average electric range across vehicles (via DIM_VEHICLE join)
+        expr: AVG(dv.ELECTRIC_RANGE)
+    time_dimensions:
+      - name: model_year
+        description: Model year as a time grain for trend analysis
+        expr: MODEL_YEAR
+        data_type: NUMBER
+
+  - name: DIM_VEHICLE
+    base_table:
+      database: EV_DEMO
+      schema: MART
+      table: DIM_VEHICLE
+    description: >
+      Vehicle dimension — one row per VIN with make, model, type, range, and price.
+    columns:
+      - name: VIN
+        description: Vehicle Identification Number (primary key)
+        data_type: VARCHAR
+      - name: MAKE
+        description: Vehicle manufacturer (e.g., TESLA, CHEVROLET, HYUNDAI)
+        data_type: VARCHAR
+      - name: MODEL
+        description: Vehicle model name (e.g., MODEL 3, BOLT EV, IONIQ 5)
+        data_type: VARCHAR
+      - name: MODEL_YEAR
+        description: Model year of the vehicle
+        data_type: NUMBER
+      - name: EV_TYPE
+        description: "Battery Electric Vehicle (BEV) or Plug-in Hybrid Electric Vehicle (PHEV)"
+        data_type: VARCHAR
+      - name: ELECTRIC_RANGE
+        description: EPA-rated electric range in miles
+        data_type: NUMBER
+      - name: BASE_MSRP
+        description: Base manufacturer's suggested retail price in USD
+        data_type: NUMBER
+
+  - name: DIM_GEOGRAPHY
+    base_table:
+      database: EV_DEMO
+      schema: MART
+      table: DIM_GEOGRAPHY
+    description: >
+      Geographic dimension — one row per unique location with demographics.
+    columns:
+      - name: GEO_KEY
+        description: Surrogate key (SHA2 hash of county+city+postal_code)
+        data_type: VARCHAR
+      - name: COUNTY
+        description: Washington State county name
+        data_type: VARCHAR
+      - name: CITY
+        description: City name
+        data_type: VARCHAR
+      - name: STATE
+        description: State abbreviation (always WA in this dataset)
+        data_type: VARCHAR
+      - name: POSTAL_CODE
+        description: 5-digit zip code
+        data_type: VARCHAR
+      - name: LEGISLATIVE_DISTRICT
+        description: WA legislative district number
+        data_type: VARCHAR
+      - name: LATITUDE
+        description: Latitude coordinate of the registration address
+        data_type: FLOAT
+      - name: LONGITUDE
+        description: Longitude coordinate of the registration address
+        data_type: FLOAT
+      - name: POPULATION
+        description: Estimated population of the zip code area
+        data_type: NUMBER
+      - name: MEDIAN_INCOME
+        description: Median household income for the zip code
+        data_type: NUMBER
+      - name: EV_CHARGING_STATIONS
+        description: Number of public EV charging stations in the zip code
+        data_type: NUMBER
+
+  - name: AGG_REGISTRATIONS_BY_YEAR
+    base_table:
+      database: EV_DEMO
+      schema: MART
+      table: AGG_REGISTRATIONS_BY_YEAR
+    description: >
+      Pre-aggregated adoption trends by model year and EV type.
+      Use for progress-toward-goal and YoY growth questions.
+    columns:
+      - name: MODEL_YEAR
+        description: Vehicle model year
+        data_type: NUMBER
+      - name: EV_TYPE
+        description: BEV or PHEV classification
+        data_type: VARCHAR
+      - name: REGISTRATION_COUNT
+        description: Total registrations for this year/type combination
+        data_type: NUMBER
+      - name: CUMULATIVE_COUNT
+        description: Running total of registrations up to this model year (by EV type)
+        data_type: NUMBER
+      - name: TARGET_EV_COUNT
+        description: State policy target for EVs in this year
+        data_type: NUMBER
+      - name: PCT_OF_GOAL
+        description: "Cumulative registrations as a fraction of the state target (0.0 to 1.0+)"
+        data_type: FLOAT
+    measures:
+      - name: total_registrations
+        description: Sum of registrations across years
+        expr: SUM(REGISTRATION_COUNT)
+      - name: latest_cumulative
+        description: Maximum cumulative count (most recent year)
+        expr: MAX(CUMULATIVE_COUNT)
+      - name: goal_progress_pct
+        description: Latest progress toward state EV target as a percentage
+        expr: MAX(PCT_OF_GOAL) * 100
+    time_dimensions:
+      - name: model_year
+        description: Model year for trend analysis
+        expr: MODEL_YEAR
+        data_type: NUMBER
+
+  - name: AGG_REGISTRATIONS_BY_COUNTY
+    base_table:
+      database: EV_DEMO
+      schema: MART
+      table: AGG_REGISTRATIONS_BY_COUNTY
+    description: >
+      Pre-aggregated geographic distribution by county and EV type.
+      Use for regional comparison and equity analysis questions.
+    columns:
+      - name: COUNTY
+        description: Washington State county name
+        data_type: VARCHAR
+      - name: EV_TYPE
+        description: BEV or PHEV classification
+        data_type: VARCHAR
+      - name: REGISTRATION_COUNT
+        description: Total registrations in this county/type
+        data_type: NUMBER
+      - name: AVG_ELECTRIC_RANGE
+        description: Average electric range of vehicles in this county
+        data_type: NUMBER
+      - name: POPULATION
+        description: County population (for per-capita calculations)
+        data_type: NUMBER
+      - name: REGISTRATIONS_PER_CAPITA
+        description: Registrations divided by population — measures adoption density
+        data_type: FLOAT
+    measures:
+      - name: total_registrations
+        description: Total registrations across counties
+        expr: SUM(REGISTRATION_COUNT)
+      - name: avg_per_capita
+        description: Average registrations per capita across counties
+        expr: AVG(REGISTRATIONS_PER_CAPITA)
+
+  - name: incentive_applications
+    base_table:
+      database: EV_DEMO
+      schema: '"public"'
+      table: '"incentive_applications"'
+    description: >
+      CDC-replicated operational table from PostgreSQL. Contains incentive
+      application records that change daily as the state processes them.
+      Use for operations questions about approval rates and program effectiveness.
+    columns:
+      - name: APPLICATION_ID
+        description: Unique application identifier
+        data_type: NUMBER
+      - name: SUBMITTED_DATE
+        description: Date the application was submitted
+        data_type: DATE
+      - name: APPLICANT_ZIP
+        description: Zip code of the applicant
+        data_type: VARCHAR
+      - name: VEHICLE_TYPE
+        description: "Type of vehicle: BEV or PHEV"
+        data_type: VARCHAR
+      - name: MAKE
+        description: Vehicle manufacturer on the application
+        data_type: VARCHAR
+      - name: MODEL
+        description: Vehicle model on the application
+        data_type: VARCHAR
+      - name: MODEL_YEAR
+        description: Model year on the application
+        data_type: NUMBER
+      - name: INCENTIVE_AMOUNT
+        description: Dollar amount of the incentive requested/approved
+        data_type: NUMBER
+      - name: STATUS
+        description: "Application status: PENDING, APPROVED, or DENIED"
+        data_type: VARCHAR
+      - name: REVIEWED_DATE
+        description: Date the application was reviewed (NULL if still pending)
+        data_type: DATE
+      - name: DENIAL_REASON
+        description: Reason for denial (NULL if approved or pending)
+        data_type: VARCHAR
+      - name: UPDATED_AT
+        description: Last update timestamp from the source system
+        data_type: TIMESTAMP_NTZ
+    measures:
+      - name: total_applications
+        description: Total number of incentive applications
+        expr: COUNT(APPLICATION_ID)
+      - name: approval_rate
+        description: Percentage of applications that were approved
+        expr: "COUNT_IF(STATUS = 'APPROVED') * 100.0 / NULLIF(COUNT(APPLICATION_ID), 0)"
+      - name: total_incentive_amount
+        description: Total dollar amount of approved incentives
+        expr: "SUM(CASE WHEN STATUS = 'APPROVED' THEN INCENTIVE_AMOUNT ELSE 0 END)"
+      - name: pending_count
+        description: Number of applications still awaiting review
+        expr: "COUNT_IF(STATUS = 'PENDING')"
+      - name: denied_count
+        description: Number of denied applications
+        expr: "COUNT_IF(STATUS = 'DENIED')"
+    time_dimensions:
+      - name: submitted_date
+        description: Application submission date for time-series analysis
+        expr: SUBMITTED_DATE
+        data_type: DATE
+
+relationships:
+  - name: fact_to_vehicle
+    left_table: FACT_EV_REGISTRATIONS
+    right_table: DIM_VEHICLE
+    join_type: LEFT
+    on:
+      - left_column: VIN
+        right_column: VIN
+
+  - name: fact_to_geography
+    left_table: FACT_EV_REGISTRATIONS
+    right_table: DIM_GEOGRAPHY
+    join_type: LEFT
+    on:
+      - left_column: GEO_KEY
+        right_column: GEO_KEY
+
+verified_queries:
+  - name: progress_toward_2030_goal
+    question: "How are we tracking against the 2030 EV adoption goal?"
+    sql: >
+      SELECT MODEL_YEAR, EV_TYPE, REGISTRATION_COUNT, CUMULATIVE_COUNT,
+             TARGET_EV_COUNT, ROUND(PCT_OF_GOAL * 100, 2) AS pct_of_goal
+      FROM EV_DEMO.MART.AGG_REGISTRATIONS_BY_YEAR
+      WHERE MODEL_YEAR >= 2020
+      ORDER BY MODEL_YEAR, EV_TYPE
+
+  - name: top_counties_by_registrations
+    question: "Which counties have the most EV registrations?"
+    sql: >
+      SELECT COUNTY, SUM(REGISTRATION_COUNT) AS total_registrations,
+             MAX(POPULATION) AS population,
+             MAX(REGISTRATIONS_PER_CAPITA) AS per_capita
+      FROM EV_DEMO.MART.AGG_REGISTRATIONS_BY_COUNTY
+      GROUP BY COUNTY
+      ORDER BY total_registrations DESC
+      LIMIT 15
+
+  - name: bev_vs_phev_market_share
+    question: "What is the BEV vs PHEV market split?"
+    sql: >
+      SELECT EV_TYPE, COUNT(*) AS registrations,
+             ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS market_share_pct
+      FROM EV_DEMO.MART.DIM_VEHICLE
+      GROUP BY EV_TYPE
+
+  - name: tesla_vs_competitors
+    question: "How does Tesla compare to other makes by registration count?"
+    sql: >
+      SELECT MAKE, COUNT(*) AS registrations, AVG(ELECTRIC_RANGE) AS avg_range
+      FROM EV_DEMO.MART.DIM_VEHICLE
+      GROUP BY MAKE
+      ORDER BY registrations DESC
+      LIMIT 10
+
+  - name: incentive_approval_rate_by_zip
+    question: "What is the incentive approval rate by zip code?"
+    sql: >
+      SELECT APPLICANT_ZIP,
+             COUNT(*) AS total_applications,
+             COUNT_IF(STATUS = 'APPROVED') AS approved,
+             ROUND(COUNT_IF(STATUS = 'APPROVED') * 100.0 / COUNT(*), 2) AS approval_rate_pct
+      FROM EV_DEMO."public"."incentive_applications"
+      GROUP BY APPLICANT_ZIP
+      ORDER BY total_applications DESC
+
+  - name: pending_application_backlog
+    question: "How many incentive applications are still pending?"
+    sql: >
+      SELECT STATUS, COUNT(*) AS application_count,
+             SUM(INCENTIVE_AMOUNT) AS total_amount
+      FROM EV_DEMO."public"."incentive_applications"
+      GROUP BY STATUS
+      ORDER BY application_count DESC
+
+  - name: high_demand_low_approval_zips
+    question: "Which zip codes have high EV demand but low incentive approval rates?"
+    sql: >
+      SELECT g.POSTAL_CODE, g.COUNTY, g.POPULATION,
+             COUNT(DISTINCT f.VIN) AS registrations,
+             ia.total_apps, ia.approval_rate_pct
+      FROM EV_DEMO.MART.FACT_EV_REGISTRATIONS f
+      JOIN EV_DEMO.MART.DIM_GEOGRAPHY g ON f.GEO_KEY = g.GEO_KEY
+      LEFT JOIN (
+          SELECT APPLICANT_ZIP,
+                 COUNT(*) AS total_apps,
+                 ROUND(COUNT_IF(STATUS = 'APPROVED') * 100.0 / COUNT(*), 2) AS approval_rate_pct
+          FROM EV_DEMO."public"."incentive_applications"
+          GROUP BY APPLICANT_ZIP
+      ) ia ON g.POSTAL_CODE = ia.APPLICANT_ZIP
+      WHERE ia.total_apps > 0
+      GROUP BY g.POSTAL_CODE, g.COUNTY, g.POPULATION, ia.total_apps, ia.approval_rate_pct
+      HAVING registrations > 50
+      ORDER BY registrations DESC, approval_rate_pct ASC
+
+  - name: cafv_eligibility_breakdown
+    question: "What percentage of registered EVs are eligible for clean fuel incentives?"
+    sql: >
+      SELECT CAFV_ELIGIBILITY, COUNT(*) AS vehicles,
+             ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS pct
+      FROM EV_DEMO.MART.FACT_EV_REGISTRATIONS
+      GROUP BY CAFV_ELIGIBILITY
+      ORDER BY vehicles DESC

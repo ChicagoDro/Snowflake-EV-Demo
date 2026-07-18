@@ -1,0 +1,49 @@
+# Cortex Agent specification for EV Demo conversational analytics.
+# Co-authored with CoCo
+#
+# Agent: EV_DEMO_ANALYST
+# Uses Cortex Analyst (semantic view) as its primary tool to answer
+# natural language questions about WA State EV registrations.
+#
+# EXTENSION NOTES:
+# ─────────────────────────────────────────────────────────────────────
+# Tool-calling (future additions):
+#   - cortex_search: web search tool for real-time EV policy news,
+#     federal incentive changes, or competitor announcements
+#   - python: custom calculations like statistical forecasting
+#     ("will we hit the 2030 goal at current growth rate?")
+#   - sql_exec: ad-hoc SQL for questions outside the semantic model
+#
+# External systems (future integrations):
+#   - CRM integration: dealer follow-up on high-demand zip codes
+#   - ERP/budget: track incentive fund balance, burn rate
+#   - GIS service: map visualizations of registration density
+#
+# Multi-turn conversation:
+#   - The agent maintains message history via thread_id
+#   - Supports drill-down: "Break that down by county" remembers context
+#   - Supports refinement: "Only show BEV" narrows previous results
+#   - Streamlit app (Prompt 14) manages the thread state client-side
+# ─────────────────────────────────────────────────────────────────────
+
+models:
+  - claude-3-5-sonnet
+
+instructions: >
+  You are an EV market analyst for Washington State. Help business users
+  understand EV adoption trends, incentive program effectiveness, and
+  progress toward the 2030 Clean Cars goal. When answering questions:
+  - Always reference specific data from the query results
+  - Provide context (e.g., "King County leads because of its population density")
+  - Suggest follow-up questions when relevant
+  - If the data doesn't support a conclusion, say so clearly
+  - Format numbers for readability (commas, percentages, rounding)
+
+tools:
+  - tool_spec:
+      type: cortex_analyst_text_to_sql
+      name: ev_registrations_analyst
+
+tool_resources:
+  ev_registrations_analyst:
+    semantic_view: EV_DEMO.MART.EV_REGISTRATIONS

@@ -21,9 +21,9 @@ EV registration data, for a state-agency audience measuring progress toward the 
 **Architecture:**
 1. Bronze: Raw CSV ingested via COPY INTO from Azure Blob stage → parsed into VARIANT → Snowpark stored procedure for structured parsing.
 2. Dynamic operational data: PostgreSQL CDC replication via Snowflake Connector for PostgreSQL (Docker agent → EV_DEMO."public") for `incentive_applications` — a frequently-changing operational table. In production, this would use OpenFlow (not available on trial accounts).
-3. Static reference data: `zip_code_demographics` and `state_ev_goals` loaded as dbt seeds into EV_DEMO.RAW (version-controlled, infrequently-changing).
-4. Silver: dbt models materialized as Dynamic Tables (joins Bronze + CDC data + seed reference data, applies business rules).
-5. Gold: dbt models materialized as Dynamic Iceberg Tables on external volume EV_EXT_VOL (Azure Blob Storage).
+3. Static reference data: `zip_code_demographics` and `state_ev_goals` loaded via direct SQL into EV_DEMO.RAW (small, static datasets — 26 rows total; source CSVs version-controlled in Git for auditability).
+4. Silver: Dynamic Tables (joins Bronze + CDC data + reference data, applies business rules). Declarative refresh via TARGET_LAG — no external scheduler needed.
+5. Gold: Dynamic Iceberg Tables on external volume EV_EXT_VOL (Azure Blob Storage). Open format for external compute portability.
 6. Semantic layer: Cortex Analyst semantic view on Gold + Cortex Agent for natural-language conversational analytics. Streamlit chat interface for business users.
 
 **Priorities:**
@@ -80,9 +80,9 @@ SELECT SYSTEM$VERIFY_EXTERNAL_VOLUME('EV_EXT_VOL');
 > **Why CDC for `incentive_applications` only?**
 > This is an operational table that changes daily as residents submit applications and the state
 > approves/denies them. CDC ensures Snowflake always has the latest status without manual ETL.
-> Static reference tables (`zip_code_demographics`, `state_ev_goals`) are loaded as **dbt seeds** instead —
-> they change annually at most, so CDC would be overkill. Version-controlling them as CSVs in the
-> dbt project makes them auditable and reproducible.
+> Static reference tables (`zip_code_demographics`, `state_ev_goals`) are loaded via **direct SQL** instead —
+> they're small (26 rows total) and change annually at most, so CDC would be overkill. The source CSVs
+> remain version-controlled in `dbt/seeds/` for Git auditability.
 
 > **Note on OpenFlow vs. Legacy Connector:**
 > The production-grade approach is **Snowflake OpenFlow Connector for PostgreSQL** (GA),
@@ -215,7 +215,7 @@ Save the code to a notebook file in setup named git_workspace_setup.ipynb
 Create folders in new Snowflake-EV-Demo Git Workspace
  - setup (one-time DDL and deployment scripts, run in order)
  - pipeline (reusable stored procs and logic called by orchestration)
- - dbt (dbt project: seeds, models, tests)
+ - dbt (dbt seed CSVs retained for Git auditability; seeds loaded via SQL instead)
  - streamlit (Streamlit apps)
  - semantic (Cortex Analyst semantic models)
  - connectors (connector config templates, no secrets)
@@ -251,7 +251,13 @@ Upload the file **ElectricVehiclePopulationData.json** to the EV_DEMO.RAW.EV_STA
 **Turn on Plan**
 ```
 1. Create table EV_DEMO.RAW.RAW_EV_REGISTRATIONS with a single VARIANT column plus load timestamp and source filename.
-2. COPY INTO it from @RAW.EV_STAGE (ElectricVehiclePopulationData.json) as raw JSON — do not flatten. This is the immutable, auditable landing zone. Show row count and one sample record.
+2. COPY INTO it from @RAW.EV_STAGE (all files on stage, not a specific filename) as raw JSON — do not flatten. This is the immutable, auditable landing zone. Show row count and one sample record.
+
+NOTE: Use a transformation subquery to map into the 3-column table:
+  COPY INTO RAW_EV_REGISTRATIONS (RAW_DATA, LOADED_AT, SOURCE_FILE)
+  FROM (SELECT $1, CURRENT_TIMESTAMP(), METADATA$FILENAME FROM @EV_DEMO.RAW.EV_STAGE)
+  FILE_FORMAT = (TYPE = 'JSON' STRIP_OUTER_ARRAY = FALSE) ON_ERROR = ABORT_STATEMENT;
+Do NOT hardcode a specific filename — the stage may contain any number of JSON files.
 
  - Comment each statement with why it exists and why it's sized/scoped that way. Confirm creation.
  - Save the code to a SQL file named 02_bronze_raw_ingest.sql in Snowflake-EV-Demo/setup 
@@ -286,6 +292,11 @@ Comment the code with why it exists and why it's written that way.
 
 Confirm creation. Then call the procedure directly to verify.
 
+After BRONZE_PARSED is created, enable change tracking on it:
+  ALTER TABLE EV_DEMO.RAW.BRONZE_PARSED SET CHANGE_TRACKING = TRUE;
+This is REQUIRED for downstream Dynamic Tables (Silver) to detect changes.
+Without it, manual REFRESH and auto-refresh will fail with "Change tracking is not enabled".
+
 Save the code to a sql file named 03_bronze_raw_ingest.sql in Snowflake-EV-Demo/setup
 Save the Snowpark stored procedure source to pipeline/sp_parse_ev_registrations.py 
 ```
@@ -294,45 +305,49 @@ CoCo Output: Script to generate SF environment **03_bronze_raw_ingest.sql**
 
 ---
 
-# CoCo Prompt 6 - Reference Data (dbt Seeds) + CDC Verification
+# CoCo Prompt 6 - Reference Data (SQL) + CDC Verification
 **Turn on Plan**
 ```
-Set up reference data as dbt seeds and verify the CDC-replicated operational table.
+Set up static reference data and verify the CDC-replicated operational table.
 
-**Part A: dbt Seeds (static reference data)**
-Create dbt seed CSV files for tables that change infrequently (annually):
+**Part A: Reference Tables (static data via SQL)**
+Create SQL CREATE TABLE + INSERT statements for tables that change infrequently (annually):
   - zip_code_demographics (zip_code, population, median_income, ev_charging_stations) — 15 WA zip codes
   - state_ev_goals (state, year, target_ev_count, policy_name) — WA targets 2025-2035
 
-Place CSVs in dbt/seeds/ and configure dbt_project.yml to load them into EV_DEMO.RAW schema.
-These are version-controlled, auditable, and don't require an external system to manage.
+Load into EV_DEMO.RAW schema. These are small, static datasets (26 rows total). Direct SQL
+is the right choice here — no external tooling dependency, and it keeps the pipeline 100%
+Snowflake-native. Document in comments when dbt seeds would be the better choice instead
+(large seed files, teams already using dbt for transformation, need for built-in schema tests,
+or cross-warehouse portability).
 
 **Part B: CDC verification**
 Verify that EV_DEMO."public".INCENTIVE_APPLICATIONS exists and has data from the Snowflake
 Connector for PostgreSQL (configured in Section B).
 
-Build:
-1. A SQL script that:
-   - Verifies EV_DEMO."public".INCENTIVE_APPLICATIONS exists (SELECT COUNT, sample rows)
-   - Checks CDC status via REPLICATION_STATE in the connector schema
-   - Creates a placeholder table in EV_DEMO.RAW if CDC hasn't synced yet (for downstream dev)
-
-2. Document in comments:
+Build a single SQL script that:
+1. Creates and populates the two reference tables (Part A)
+2. Verifies EV_DEMO."public".INCENTIVE_APPLICATIONS exists (SELECT COUNT, sample rows)
+3. Checks CDC status via the connector status procedure
+4. Documents in comments:
    - Why CDC for incentive_applications (operational, status changes daily)
-   - Why dbt seeds for zip/goals (static, version-controlled, no external dependency)
+   - Why direct SQL for zip/goals (small, static, no external dependency)
    - Join paths: applicant_zip ↔ postal_code, make/model ↔ make/model
+5. Grants SELECT on CDC table and reference tables to EV_DEMO_ENGINEER
 
-3. Grant SELECT on CDC table to EV_DEMO_ENGINEER if not already granted.
-
-Comment each object. Save to setup/04_reference_tables.sql in Snowflake-EV-Demo
+Comment each object. Save code to setup/04_static_reference_tables.sql in Snowflake-EV-Demo
 ```
-**CoCo Output:** Reference data setup **setup/04_reference_tables.sql** + **dbt/seeds/*.csv**
+**CoCo Output:** Reference data + CDC verification **setup/04_static_reference_tables.sql**
 
 ---
 
 # CoCo Prompt 7 - Silver Dynamic Table (Enriched with Reference Data)
 **Turn on Plan**
 ```
+PREREQUISITE: EV_DEMO.RAW.BRONZE_PARSED must have CHANGE_TRACKING = TRUE before creating
+Dynamic Tables that source from it. If not already set, include this at the top of the script:
+  ALTER TABLE EV_DEMO.RAW.BRONZE_PARSED SET CHANGE_TRACKING = TRUE;
+
 Create a Dynamic Table EV_DEMO.CLEAN.SILVER_EV_REGISTRATIONS sourced from EV_DEMO.RAW.BRONZE_PARSED with TARGET_LAG = '60 minutes' on warehouse WH_EV_DEMO.
 
 Logic (structural + business rules + enrichment):
@@ -341,11 +356,21 @@ Logic (structural + business rules + enrichment):
 3. Parse VEHICLE_LOCATION (format: "POINT (lng lat)") into LONGITUDE FLOAT and LATITUDE FLOAT columns.
 4. Cast POSTAL_CODE to VARCHAR(10), LEGISLATIVE_DISTRICT to VARCHAR(5).
 5. Validate: filter OUT rows where ev_type NOT IN ('Battery Electric Vehicle (BEV)', 'Plug-in Hybrid Electric Vehicle (PHEV)') OR electric_range < 0 OR VIN IS NULL. Route these to a quarantine table instead.
-6. LEFT JOIN to EV_DEMO.RAW.ZIP_CODE_DEMOGRAPHICS (dbt seed) on postal_code = zip_code to enrich with population, median_income, ev_charging_stations.
-7. LEFT JOIN to EV_DEMO.RAW.STATE_EV_GOALS (dbt seed) on state = state AND model_year = year to enrich with target_ev_count and policy_name.
-8. LEFT JOIN to EV_DEMO."public".INCENTIVE_APPLICATIONS (CDC-replicated) on UPPER(make) = make AND UPPER(model) = model AND postal_code = applicant_zip to enrich with incentive_amount, application status. Use latest application per vehicle match.
+6. LEFT JOIN to EV_DEMO.RAW.ZIP_CODE_DEMOGRAPHICS (reference table) on POSTAL_CODE = ZIP_CODE to enrich with POPULATION, MEDIAN_INCOME, EV_CHARGING_STATIONS.
+7. LEFT JOIN to EV_DEMO.RAW.STATE_EV_GOALS (reference table) on STATE = STATE AND MODEL_YEAR = YEAR to enrich with TARGET_EV_COUNT and POLICY_NAME.
+8. LEFT JOIN to EV_DEMO."public"."incentive_applications" (CDC-replicated) to enrich with INCENTIVE_AMOUNT and STATUS. Use latest application per vehicle match (ROW_NUMBER partitioned by MAKE, MODEL, APPLICANT_ZIP ordered by UPDATED_AT DESC, keep rn=1). Join condition: UPPER(bronze.MAKE) = UPPER(cdc.MAKE) AND UPPER(bronze.MODEL) = UPPER(cdc.MODEL) AND bronze.POSTAL_CODE = cdc.APPLICANT_ZIP.
+
+IMPORTANT — CDC table column naming:
+The Snowflake Connector for PostgreSQL replicates columns as UPPERCASE unquoted identifiers.
+The TABLE and SCHEMA names remain lowercase-quoted: EV_DEMO."public"."incentive_applications"
+But COLUMN names are standard uppercase: MAKE, MODEL, APPLICANT_ZIP, INCENTIVE_AMOUNT, STATUS, UPDATED_AT.
+Do NOT quote column names in lowercase — that will cause "invalid identifier" errors.
 
 Also create a Dynamic Table EV_DEMO.CLEAN.QUARANTINE_EV_REGISTRATIONS (same source, same lag) capturing rejected rows with a REJECTION_REASON column explaining why each row failed.
+
+For verification, use:
+  SELECT name, scheduling_state FROM TABLE(EV_DEMO.INFORMATION_SCHEMA.DYNAMIC_TABLES()) WHERE SCHEMA_NAME = 'CLEAN';
+(Must qualify with database name. Do NOT use SNOWFLAKE.INFORMATION_SCHEMA.DYNAMIC_TABLES — that is not a valid view.)
 
 Comment each object with why it exists.
 Save the code to a SQL file named 05_silver_dynamic_tables.sql in Snowflake-EV-Demo/setup
@@ -365,13 +390,23 @@ Build these Gold models:
 
 2. MART.DIM_GEOGRAPHY — distinct geographic dimension (county, city, state, postal_code, legislative_district, latitude, longitude, population, median_income, ev_charging_stations). Surrogate key via SHA2 hash of county+city+postal_code.
 
-3. MART.FACT_EV_REGISTRATIONS — fact table joining to dims via VIN and geo surrogate key. Include cafv_eligibility, electric_utility, census_tract, target_ev_count, policy_name.
+3. MART.FACT_EV_REGISTRATIONS — fact table joining to dims via VIN and geo surrogate key. Include cafv_eligibility, electric_utility, census_tract, target_ev_count, policy_name, and load_ts.
 
 4. MART.AGG_REGISTRATIONS_BY_COUNTY — registrations grouped by county, ev_type, with total count, avg electric range, population, and registrations_per_capita (count / population).
 
 5. MART.AGG_REGISTRATIONS_BY_YEAR — registrations grouped by model_year, ev_type, showing adoption trends (count, cumulative count, target_ev_count, pct_of_goal).
 
 Each table should use CATALOG = 'SNOWFLAKE' and BASE_LOCATION pointing to a subfolder matching the table name.
+
+IMPORTANT — Iceberg data type limitations:
+Iceberg tables only support TIMESTAMP_NTZ at microsecond precision (scale 6).
+They do NOT support TIMESTAMP_LTZ or TIMESTAMP_TZ, and do NOT support nanosecond scale (9).
+If any source column is TIMESTAMP_LTZ(9) (e.g., LOAD_TS from Silver), you MUST cast it:
+  CAST(LOAD_TS AS TIMESTAMP_NTZ(6)) AS LOAD_TS
+Failure to cast will produce: "Invalid time type scale specified for column..."
+
+For grants, use GRANT SELECT ON ICEBERG TABLE (not ON DYNAMIC TABLE).
+For verification, use SHOW DYNAMIC TABLES LIKE '%' IN SCHEMA EV_DEMO.MART to confirm is_iceberg = true.
 
 Comment each object with why it exists and what insights it enables.
 Save the code to a SQL file named 06_gold_iceberg_tables.sql in Snowflake-EV-Demo/setup
@@ -387,12 +422,21 @@ Generate a SQL file with verification queries to run live during a demo, proving
 end-to-end through the pipeline. Organize into clearly labeled sections:
 
 1. BRONZE — row counts for RAW_EV_REGISTRATIONS and BRONZE_PARSED, sample rows
-2. CDC — EV_DEMO."public".INCENTIVE_APPLICATIONS counts by status, connector REPLICATION_STATE
-3. REFERENCE — dbt seed table counts (ZIP_CODE_DEMOGRAPHICS, STATE_EV_GOALS)
-4. SILVER — row count + freshness, sample enriched rows showing joined data, quarantine breakdown,
-   Dynamic Table refresh status from INFORMATION_SCHEMA.DYNAMIC_TABLES()
-5. GOLD — dimension/fact counts, a quick business insight query (top makes), Iceberg table refresh status
+2. CDC — EV_DEMO."public"."incentive_applications" counts by status, connector status check
+3. REFERENCE — reference table counts (ZIP_CODE_DEMOGRAPHICS, STATE_EV_GOALS)
+4. SILVER — row count, sample enriched rows showing joined data, quarantine breakdown,
+   Dynamic Table refresh status
+5. GOLD — dimension/fact counts, a quick business insight query (top makes), Iceberg table status
 6. PIPELINE HEALTH SUMMARY — single query comparing row counts across all layers
+
+IMPORTANT technical notes for this file:
+- For Dynamic Table status, use: SELECT NAME, SCHEDULING_STATE FROM TABLE(EV_DEMO.INFORMATION_SCHEMA.DYNAMIC_TABLES()) WHERE SCHEMA_NAME = 'CLEAN';
+- For Gold Iceberg table status, use: SHOW DYNAMIC TABLES LIKE '%' IN SCHEMA EV_DEMO.MART;
+- Do NOT query LOAD_TS from Gold/Iceberg tables for freshness — it was cast to TIMESTAMP_NTZ(6).
+  For freshness checks, query LOAD_TS from Silver (Dynamic Table) instead — Silver supports TIMESTAMP_LTZ(9).
+- CDC table: schema/table names are lowercase-quoted, column names are UPPERCASE unquoted.
+- RAW_EV_REGISTRATIONS columns are: RAW_DATA (VARIANT), LOADED_AT (TIMESTAMP_NTZ), SOURCE_FILE (VARCHAR).
+  The timestamp column is LOADED_AT, NOT LOAD_TS.
 
 This is NOT automated monitoring (that's the OBS layer). This is a "show don't tell" script
 for walking someone through the pipeline during a live demo or interview.
@@ -411,15 +455,26 @@ Build data quality monitoring in EV_DEMO.OBS using Snowflake Data Metric Functio
 1. Create custom DMFs for:
    - COMPLETENESS: % of non-null VINs in BRONZE_PARSED vs SILVER
    - UNIQUENESS: duplicate VIN count in Silver (should be 0)
-   - FRESHNESS: minutes since last LOAD_TS in each layer
    - BUSINESS_RULES: count of rows where electric_range < 0 or ev_type is invalid (should be 0 in Silver, captured in Quarantine)
-   - ROW_COUNT_RECONCILIATION: compare row counts across Bronze → Silver → Gold (Silver + Quarantine should equal Bronze)
+   - ROW_COUNT_RECONCILIATION: compare distinct VIN count in Bronze vs Silver + Quarantine (difference should be 0)
 
-2. Attach DMFs to the Silver and Gold tables using ALTER TABLE ... SET DATA_METRIC_SCHEDULE.
+2. For FRESHNESS, use the built-in system DMF SNOWFLAKE.CORE.FRESHNESS (do NOT create a custom DMF for this — custom DMFs cannot use non-deterministic functions like CURRENT_TIMESTAMP).
 
-3. Create a view OBS.V_DATA_QUALITY_DASHBOARD that queries SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS to surface all DMF results in one place.
+3. Attach DMFs to the Silver and Quarantine tables using ALTER TABLE ... SET DATA_METRIC_SCHEDULE.
+   NOTE: Dynamic Tables and Dynamic Iceberg Tables support DMFs. Attach to Silver (CLEAN schema).
 
-4. Create a notification integration and an ALERT that fires when any quality metric breaches its threshold.
+4. Create a view OBS.V_DATA_QUALITY_DASHBOARD that queries SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS to surface all DMF results in one place.
+
+5. Create a notification integration and an ALERT that fires when any quality metric breaches its threshold.
+
+IMPORTANT — DMF limitations:
+- DMF expressions MUST be deterministic. Do NOT use CURRENT_TIMESTAMP(), CURRENT_DATE(), or any non-deterministic function inside a DMF body. This will cause: "Data metric function body cannot refer to the non-deterministic function..."
+- For freshness/staleness checks, use the built-in SNOWFLAKE.CORE.FRESHNESS system DMF instead.
+- DMFs require Enterprise Edition and the EXECUTE DATA METRIC FUNCTION account privilege.
+- DATA_METRIC_SCHEDULE valid intervals are ONLY: 5, 15, 30, 60, 720, 1440 MINUTES (plural), 'TRIGGER_ON_CHANGES', or 'USING CRON ...'. Other values like 120 or 360 MINUTES are INVALID.
+- INFORMATION_SCHEMA table functions must be qualified with the database name: TABLE(EV_DEMO.INFORMATION_SCHEMA.DATA_METRIC_FUNCTION_REFERENCES(...)), not TABLE(INFORMATION_SCHEMA.DATA_METRIC_FUNCTION_REFERENCES(...)).
+- ALLOWED_RECIPIENTS in notification integrations must use validated emails belonging to users in the account. Use: norm@tamisin.com
+- For alert SCHEDULE, use CRON syntax: 'USING CRON 0 */2 * * * America/Los_Angeles' (not '120 MINUTES').
 
 Comment each object. Save to setup/07_data_quality.sql in Snowflake-EV-Demo
 ```
@@ -440,11 +495,22 @@ Architecture:
 - Final Task: TASK_QUALITY_CHECK — runs after parse, executes a stored procedure that checks DMF results and raises an alert if thresholds are breached.
 
 Requirements:
-- SUSPEND_TASK_AFTER_NUM_FAILURES = 3 (circuit breaker)
+- SUSPEND_TASK_AFTER_NUM_FAILURES = 3 on ROOT TASK ONLY (child tasks inherit this from the root — setting it on a child task causes an error: "Cannot set parameter SUSPEND_TASK_AFTER_NUM_FAILURES on non-root task")
 - Warehouse: WH_EV_DEMO
-- Schedule on root task: USING CRON '0 */6 * * *' (every 6 hours, or when stream has data — whichever comes first)
-- Error handling: each task should log failures to OBS.TASK_RUN_LOG table
+- Schedule on root task: 'USING CRON 0 */6 * * * America/Los_Angeles' (every 6 hours, or when stream has data — whichever comes first)
+- Error handling: each task should log failures to OBS.TASK_RUN_LOG table via a helper stored procedure
 - Grant EXECUTE TASK to EV_DEMO_ENGINEER
+- Resume tasks in correct order: child tasks first, root task last
+
+IMPORTANT — Task implementation notes:
+- COPY INTO with JSON file format into a multi-column table (RAW_DATA, LOADED_AT, SOURCE_FILE) MUST use a transformation subquery:
+    COPY INTO EV_DEMO.RAW.RAW_EV_REGISTRATIONS (RAW_DATA, LOADED_AT, SOURCE_FILE)
+    FROM (SELECT $1, CURRENT_TIMESTAMP(), METADATA$FILENAME FROM @EV_DEMO.RAW.EV_STAGE)
+    FILE_FORMAT = (TYPE = 'JSON' STRIP_OUTER_ARRAY = FALSE) ON_ERROR = 'CONTINUE';
+  A bare "COPY INTO table FROM @stage" will fail with: "JSON file format can produce one and only one column of type variant"
+- SQLERRM does NOT exist in Snowflake SQL scripting (it's Oracle/PL-SQL). In EXCEPTION WHEN OTHER handlers, use a static error message string instead:
+    LET err_msg VARCHAR := 'Task failed — check TASK_HISTORY for details';
+  Do NOT reference SQLERRM or SQLCODE — they will cause "invalid identifier" errors.
 
 Comment each object. Save to setup/08_orchestration.sql in Snowflake-EV-Demo
 ```
@@ -480,50 +546,69 @@ Comment each object. Save to setup/09_data_sharing.sql in Snowflake-EV-Demo
 # CoCo Prompt 13 - Semantic Model & Cortex Agent
 **Turn on Plan**
 ```
-Build a semantic layer for conversational analytics on the EV Demo Gold layer.
+Build the semantic layer artifacts for conversational analytics on the EV Demo Gold layer.
 
-**Part A: Semantic View**
-Create a Cortex Analyst semantic view YAML covering:
+**Part A: Verified Queries CSV (for Semantic View wizard)**
+Generate a CSV file at semantic/verified_queries.csv for upload to the Cortex Analyst Semantic View wizard.
+Format: two columns (question, sql) with a header row. Enclose SQL in double quotes (standard CSV escaping).
 
-Tables:
-- MART.FACT_EV_REGISTRATIONS (measures: registration_count, avg_electric_range, pct_of_goal)
-- MART.DIM_VEHICLE (dimensions: make, model, model_year, ev_type, electric_range, cafv_eligibility)
-- MART.DIM_GEOGRAPHY (dimensions: county, city, state, postal_code, population, median_income, ev_charging_stations)
-- MART.AGG_REGISTRATIONS_BY_YEAR (measures: count, cumulative_count, target_ev_count, pct_of_goal)
-- MART.AGG_REGISTRATIONS_BY_COUNTY (measures: count, registrations_per_capita, avg_electric_range)
-- EV_DEMO."public".INCENTIVE_APPLICATIONS (measures: approval_rate, total_incentive_amount, pending_count; dimensions: status, vehicle_type, applicant_zip)
+Tables available in the semantic view (MART schema only):
+- MART.FACT_EV_REGISTRATIONS (VIN, GEO_KEY, MODEL_YEAR, CAFV_ELIGIBILITY, ELECTRIC_UTILITY, CENSUS_TRACT, TARGET_EV_COUNT, POLICY_NAME, INCENTIVE_AMOUNT, APPLICATION_STATUS, LOAD_TS)
+- MART.DIM_VEHICLE (VIN, MAKE, MODEL, MODEL_YEAR, EV_TYPE, ELECTRIC_RANGE, BASE_MSRP)
+- MART.DIM_GEOGRAPHY (GEO_KEY, COUNTY, CITY, STATE, POSTAL_CODE, LEGISLATIVE_DISTRICT, LATITUDE, LONGITUDE, POPULATION, MEDIAN_INCOME, EV_CHARGING_STATIONS)
+- MART.AGG_REGISTRATIONS_BY_YEAR (MODEL_YEAR, EV_TYPE, REGISTRATION_COUNT, CUMULATIVE_COUNT, TARGET_EV_COUNT, PCT_OF_GOAL)
+- MART.AGG_REGISTRATIONS_BY_COUNTY (COUNTY, EV_TYPE, REGISTRATION_COUNT, AVG_ELECTRIC_RANGE, POPULATION, REGISTRATIONS_PER_CAPITA)
 
-Define:
-- Time grains (model_year, submitted_date)
-- Relationships/joins between tables
-- Business-friendly names and descriptions for all columns
-- Verified queries (5-8) covering the question categories below
-
-Question categories the model must support:
+Include 5-8 queries covering these question categories:
 - Executive: YoY growth, regional adoption rates, BEV vs PHEV market penetration, progress toward 2030 goal
 - Sales/Marketing: Tesla vs competitors by region, CAFV eligibility %, trending models by demographic
-- Operations (leveraging CDC data): incentive approval rates by zip, pending application backlog,
-  denial reasons breakdown, avg days to review, which zip codes have high demand but low approval rates
+- Operations: incentive approval rates (via APPLICATION_STATUS in FACT), which counties have high demand but low per-capita adoption
 
-Save semantic view to semantic/ev_registrations.yaml
+**Part B: Cortex Agent Deployment Script**
+Create a SQL deployment script (setup/10_deploy_cortex.sql) that:
+1. Creates the Cortex Agent: CREATE OR REPLACE AGENT EV_DEMO.MART.EV_DEMO_ANALYST FROM SPECIFICATION $$...$$
+   - Agent name: EV_DEMO_ANALYST
+   - Instructions: "You are an EV market analyst for Washington State. Help business users understand EV adoption trends, incentive program effectiveness, and progress toward the 2030 goal."
+   - Tool: cortex_analyst_text_to_sql pointing to EV_DEMO.MART.EV_REGISTRATIONS
+2. Grants USAGE on the semantic view and agent to EV_DEMO_ENGINEER.
+3. Verifies with SHOW AGENTS and a test query using SNOWFLAKE.CORTEX.DATA_AGENT_RUN.
 
-**Part B: Cortex Agent**
-Create a Cortex Agent that uses the semantic view as a tool.
+The script should start with SHOW SEMANTIC VIEWS to verify the semantic view exists (it's deployed via UI, not SQL).
 
-- Agent name: EV_DEMO_ANALYST
-- Instructions: "You are an EV market analyst for Washington State. Help business users understand
-  EV adoption trends, incentive program effectiveness, and progress toward the 2030 goal."
-- Tool: cortex_analyst with the semantic view
-
-Save agent spec to semantic/ev_analyst_agent.yaml
-
-**Part C: Agent Integration Notes (comments in the agent YAML)**
+**Part C: Agent Integration Notes (comments in the agent spec)**
 Document how this could be extended for:
 - Tool-calling: adding a web search tool for real-time EV news, a Python tool for custom calculations
 - External systems: CRM integration for dealer follow-up, ERP for budget tracking
 - Multi-turn: maintaining conversation context for drill-down analysis
+
+Save verified queries to semantic/verified_queries.csv
+Save deployment script to setup/10_deploy_cortex.sql
 ```
-**CoCo Output:** Semantic view **semantic/ev_registrations.yaml** + Agent **semantic/ev_analyst_agent.yaml**
+**CoCo Output:** Verified queries **semantic/verified_queries.csv** + Deployment **setup/10_deploy_cortex.sql**
+
+---
+
+# Deploy Semantic View (Manual via Snowsight UI)
+
+The semantic view YAML cannot be deployed via raw SQL or reliably via the CoCo semantic_studio tool in all account types. Deploy it manually through the Snowsight UI:
+
+1. Go to **AI & ML → Cortex Analyst → Semantic Views**
+2. Click **Create Semantic View**
+3. Set name: `EV_REGISTRATIONS`, database: `EV_DEMO`, schema: `MART`
+4. Add these tables:
+   - `EV_DEMO.MART.FACT_EV_REGISTRATIONS`
+   - `EV_DEMO.MART.DIM_VEHICLE`
+   - `EV_DEMO.MART.DIM_GEOGRAPHY`
+   - `EV_DEMO.MART.AGG_REGISTRATIONS_BY_YEAR`
+   - `EV_DEMO.MART.AGG_REGISTRATIONS_BY_COUNTY`
+   - `EV_DEMO."public"."incentive_applications"` (CDC table)
+5. The wizard auto-detects columns — mark dimensions, metrics, and relationships:
+   - **Relationships:** FACT.VIN → DIM_VEHICLE.VIN, FACT.GEO_KEY → DIM_GEOGRAPHY.GEO_KEY
+   - **Key metrics:** COUNT(VIN) as registration_count, AVG(ELECTRIC_RANGE), approval_rate, etc.
+   - Use `semantic/ev_registrations.yaml` as a reference for column descriptions and verified queries
+6. Save and verify: `SHOW SEMANTIC VIEWS IN SCHEMA EV_DEMO.MART;`
+
+Then run **setup/10_deploy_cortex.sql** to create the agent and grants.
 
 ---
 

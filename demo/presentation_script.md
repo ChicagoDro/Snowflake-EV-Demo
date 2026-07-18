@@ -47,7 +47,7 @@
                                               ↓ Snowpark Parse
   [PostgreSQL CDC] → Connector Agent → EV_DEMO."public" (CDC)
                                               ↓
-  [dbt Seeds] ────────────────────→ EV_DEMO.RAW (Reference)
+  [SQL Seeds] ────────────────────→ EV_DEMO.RAW (Reference)
                                               ↓
                               Silver (Dynamic Tables) ← joins all sources
                                               ↓
@@ -67,7 +67,7 @@
 | Raw landing | VARIANT + COPY INTO | Snowpipe | Batch is sufficient for this cadence; Snowpipe adds cost for low-volume |
 | Parsing | Snowpark Python SP | SQL FLATTEN | JSON has dynamic column metadata; Snowpark adapts at runtime |
 | CDC ingestion | SF Connector for PostgreSQL | Custom Snowpipe + Kafka | Managed = zero custom code; OpenFlow in production |
-| Static reference | dbt seeds | COPY INTO from file | Version-controlled in git, auditable, reproducible |
+| Static reference | SQL CREATE + INSERT | dbt seeds / COPY INTO | Small static data (26 rows total); no external tooling dependency; version-controlled in git |
 | Silver | Dynamic Tables | dbt incremental + Tasks | Declarative refresh, no scheduling code, Snowflake-managed |
 | Gold | Dynamic Iceberg Tables | Regular tables | Open format for external compute; cost separation |
 | Orchestration | Stream + Task graph | Airflow / dbt Cloud | Native, no external tool; event-driven not time-based |
@@ -88,14 +88,14 @@
 - Dynamic Tables = compute only when upstream changes (not on schedule)
 - Iceberg = storage-compute separation (Azure Blob pricing vs. Snowflake managed storage)
 - CDC at 15-min intervals (not continuous streaming — right-sized for the data cadence)
-- dbt seeds for static data (zero ongoing compute cost — loaded once)
+- Static reference data loaded once via SQL (zero ongoing compute cost; source CSVs in Git for auditability)
 - Stream + Task = event-driven (no polling; warehouse sleeps when no files arrive)
 - Role separation (EV_DEMO_ENGINEER) prevents accidental ACCOUNTADMIN compute usage
 
 ### Slide 7: CI/CD & Governance
 - Git-connected Snowflake Workspace (bidirectional sync)
 - Purpose-scoped role (EV_DEMO_ENGINEER) avoids ACCOUNTADMIN drift
-- dbt seeds = version-controlled reference data
+- SQL-based reference data with CSVs in Git for auditability
 - Secure views + SHARE object for governed cross-account access
 - DMFs as automated quality attestation (auditors can see SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS)
 
@@ -116,16 +116,18 @@
 
 **Say:** "This is a real Azure Database for PostgreSQL Flexible Server, replicating via the Snowflake Connector for PostgreSQL. The agent runs as a Docker container, reading WAL logs and pushing changes every 15 minutes."
 
-**Say:** "I chose CDC here because incentive applications change daily — statuses flip from PENDING to APPROVED or DENIED. For static reference data like zip demographics, I use dbt seeds instead. Right tool for the right data cadence."
+**Say:** "I chose CDC here because incentive applications change daily — statuses flip from PENDING to APPROVED or DENIED. For static reference data like zip demographics, I use direct SQL loads from version-controlled CSVs. Right tool for the right data cadence."
 
 **Say:** "In production, this would be OpenFlow — the GA successor with NiFi-based visual flow design and SPCS deployment. Trial accounts don't have access, but the pattern is identical."
 
 ### 1c. Silver — Dynamic Tables & Transformations (4 min)
 - Run SILVER section: enriched rows, quarantine breakdown, Dynamic Table refresh status
 
-**Say:** "Silver joins three sources: batch registrations from Bronze, CDC incentive data, and dbt seed demographics. It deduplicates by VIN, standardizes text, parses geospatial data, and validates business rules."
+**Say:** "Silver joins three sources: batch registrations from Bronze, CDC incentive data, and static reference tables (demographics and state goals). It deduplicates by VIN, standardizes text, parses geospatial data, and validates business rules."
 
-**Say:** "Invalid rows don't disappear — they route to a quarantine table with a REJECTION_REASON column. This is critical for a government audience: every record is accounted for."
+**Say:** "You'll notice Bronze has 22,000 rows but Silver has about 5,000. That's deduplication at work — the state's export contains multiple snapshots of the same vehicle over time. Silver keeps one row per VIN, the latest record. This is intentional, not data loss."
+
+**Say:** "Invalid rows don't disappear — they route to a quarantine table with a REJECTION_REASON column. The reconciliation is: distinct VINs in Bronze = Silver + Quarantine. Every vehicle is accounted for."
 
 **Say:** "Dynamic Tables handle refresh automatically. TARGET_LAG of 60 minutes means Snowflake decides when to recompute based on upstream changes. I don't manage cron schedules or incremental logic — it's declarative."
 
@@ -140,6 +142,11 @@
 
 ### 1e. Orchestration (2 min)
 - Show Task graph structure (or run INFORMATION_SCHEMA query for tasks)
+
+> **DEMOER PREP:** Before this section, upload a new JSON file (different filename) to
+> `@EV_DEMO.RAW.EV_STAGE`, then run `demo/force_pipeline_run.sql` to push data through
+> all layers immediately. Dynamic Tables have TARGET_LAG of 60-120 minutes — the force
+> script bypasses the wait so you can show fresh data in real-time during the demo.
 
 **Say:** "The pipeline is event-driven: a Directory Table Stream watches the stage for new files. When a file lands, TASK_INGEST_RAW fires, then TASK_PARSE_BRONZE runs after it completes. Dynamic Tables handle Silver and Gold refresh on their own."
 
@@ -177,7 +184,7 @@
 
 3. **"Which zip codes have high demand but low approval rates?"**
    - Cross-source join (registrations + incentives + demographics)
-   - **Say:** "This is the powerful one — it joins registrations from batch, incentive data from CDC, and demographics from dbt seeds. Three ingestion patterns, one natural language question."
+   - **Say:** "This is the powerful one — it joins registrations from batch, incentive data from CDC, and demographics from reference tables. Three ingestion patterns, one natural language question."
 
 4. **Follow-up: "Break that down by BEV vs PHEV"**
    - Multi-turn drill-down
@@ -203,7 +210,7 @@
 ### Likely Questions & Answers
 
 **"Why Dynamic Tables instead of dbt models with Tasks?"**
-→ "For Silver/Gold, the refresh logic is pure SQL joins and aggregations — no testing framework needed at that layer. Dynamic Tables eliminate scheduling code entirely. I'd use dbt if I needed the testing framework or had a team of analytics engineers managing hundreds of models."
+→ "For Silver/Gold, the refresh logic is pure SQL joins and aggregations — no testing framework needed at that layer. Dynamic Tables eliminate scheduling code entirely. I'd use dbt if I had a large analytics engineering team managing hundreds of models, needed dbt's built-in testing framework (unique, not_null, accepted_values), required Jinja templating for complex conditional logic, or needed cross-warehouse portability (BigQuery, Redshift). For this pipeline — small team, Snowflake-native, declarative refresh — Dynamic Tables are simpler and require no external tooling."
 
 **"Why not Snowpipe instead of COPY INTO + Tasks?"**
 → "The data arrives in daily/weekly batches, not a continuous stream. Snowpipe adds always-on cost for a low-frequency feed. Stream + Task is event-driven and costs nothing when no files arrive."

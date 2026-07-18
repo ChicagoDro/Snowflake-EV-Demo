@@ -1,0 +1,31 @@
+name: 'ev_demo'
+version: '1.0.0'
+
+profile: 'default'
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+seeds:
+  ev_demo:
+    +schema: RAW
+    +database: EV_DEMO
+    zip_code_demographics:
+      +column_types:
+        zip_code: varchar(10)
+        population: integer
+        median_income: integer
+        ev_charging_stations: integer
+    state_ev_goals:
+      +column_types:
+        state: varchar(2)
+        year: integer
+        target_ev_count: integer
+        policy_name: varchar(100)

@@ -642,4 +642,47 @@ Save the Streamlit app to streamlit/ev_insights_app.py in Snowflake-EV-Demo
 ```
 **CoCo Output:** Streamlit insights + chat app **streamlit/ev_insights_app.py**
 
+#### Manual Step: Deploy Streamlit App
+
+After CoCo generates the app file, deploy it as a Streamlit in Snowflake (SiS) object.
+Run these statements in order (the workspace `snow://` URI requires copying to a named stage first):
+
+```sql
+-- Create a named stage for the Streamlit source files
+CREATE STAGE IF NOT EXISTS EV_DEMO.MART.STREAMLIT_STAGE
+  DIRECTORY = (ENABLE = TRUE);
+
+-- Copy app file from workspace to the named stage
+COPY FILES
+  INTO @EV_DEMO.MART.STREAMLIT_STAGE
+  FROM 'snow://workspace/USER$.PUBLIC."Snowflake-EV-Demo"/versions/live/streamlit/';
+
+-- Create the Streamlit app using the FROM syntax
+CREATE OR REPLACE STREAMLIT EV_DEMO.MART.EV_INSIGHTS_APP
+  FROM '@EV_DEMO.MART.STREAMLIT_STAGE'
+  MAIN_FILE = 'ev_insights_app.py'
+  QUERY_WAREHOUSE = 'WH_EV_DEMO';
+
+-- Initialize the live version
+ALTER STREAMLIT EV_DEMO.MART.EV_INSIGHTS_APP ADD LIVE VERSION FROM LAST;
+
+-- Grant access
+GRANT USAGE ON STREAMLIT EV_DEMO.MART.EV_INSIGHTS_APP TO ROLE PUBLIC;
+```
+
+#### Accessing the Streamlit App
+
+Once deployed, open the app in Snowsight:
+
+1. Navigate to **Projects → Streamlit** in the left sidebar.
+2. Select **EV_INSIGHTS_APP** under `EV_DEMO.MART`.
+3. The app opens in-browser — no additional infrastructure required.
+
+Direct URL format:
+```
+https://<your-account>.snowflakecomputing.com/#/streamlit-apps/EV_DEMO.MART.EV_INSIGHTS_APP
+```
+
+Any role granted `USAGE` on the Streamlit object (e.g., `PUBLIC`) can access the app.
+
 ---

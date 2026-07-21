@@ -226,11 +226,15 @@ tables:
     description: >
       CDC-replicated operational table from PostgreSQL. Contains incentive
       application records that change daily as the state processes them.
+      Joined to registrations by VIN for deterministic 1:1 matching.
       Use for operations questions about approval rates and program effectiveness.
     columns:
       - name: APPLICATION_ID
         description: Unique application identifier
         data_type: NUMBER
+      - name: VIN
+        description: Vehicle Identification Number linking to registration data
+        data_type: VARCHAR
       - name: SUBMITTED_DATE
         description: Date the application was submitted
         data_type: DATE
@@ -302,6 +306,14 @@ relationships:
     on:
       - left_column: GEO_KEY
         right_column: GEO_KEY
+
+  - name: fact_to_incentive
+    left_table: FACT_EV_REGISTRATIONS
+    right_table: incentive_applications
+    join_type: LEFT
+    on:
+      - left_column: VIN
+        right_column: VIN
 
 verified_queries:
   - name: progress_toward_2030_goal

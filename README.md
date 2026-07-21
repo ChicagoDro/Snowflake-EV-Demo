@@ -110,8 +110,8 @@ SELECT SYSTEM$VERIFY_EXTERNAL_VOLUME('EV_EXT_VOL');
 
    This creates:
    - `ev_reference` database
-   - `incentive_applications` (dynamic operational table — the CDC target)
-   - Seed data (15 rows with realistic WA incentive applications)
+   - `incentive_applications` (dynamic operational table — the CDC target, joined by VIN)
+   - Seed data (15 rows with realistic WA incentive applications referencing real VINs)
    - A publication (`snowflake_pub`) for CDC replication
    - A dedicated replication user
 
@@ -148,9 +148,11 @@ into Snowflake via the Snowflake Connector for PostgreSQL (CDC).
 Create this table in the public schema:
 
 1. incentive_applications (the CDC target — simulates daily operational data)
-   - application_id (SERIAL PK), submitted_date, applicant_zip, vehicle_type (BEV/PHEV),
+   - application_id (SERIAL PK), vin (VARCHAR(17) NOT NULL — links to DOL registration VIN),
+     submitted_date, applicant_zip, vehicle_type (BEV/PHEV),
      make, model, model_year, incentive_amount, status (PENDING/APPROVED/DENIED),
      reviewed_date, denial_reason, updated_at
+   - VINs must reference actual vehicles from the WA DOL registration dataset
    - Seed with 15 rows showing a realistic mix of statuses, popular EV makes/models,
      and denial reasons (income threshold, MSRP cap)
    - Use Washington State zip codes and recent dates (June–July 2026)
@@ -358,12 +360,12 @@ Logic (structural + business rules + enrichment):
 5. Validate: filter OUT rows where ev_type NOT IN ('Battery Electric Vehicle (BEV)', 'Plug-in Hybrid Electric Vehicle (PHEV)') OR electric_range < 0 OR VIN IS NULL. Route these to a quarantine table instead.
 6. LEFT JOIN to EV_DEMO.RAW.ZIP_CODE_DEMOGRAPHICS (reference table) on POSTAL_CODE = ZIP_CODE to enrich with POPULATION, MEDIAN_INCOME, EV_CHARGING_STATIONS.
 7. LEFT JOIN to EV_DEMO.RAW.STATE_EV_GOALS (reference table) on STATE = STATE AND MODEL_YEAR = YEAR to enrich with TARGET_EV_COUNT and POLICY_NAME.
-8. LEFT JOIN to EV_DEMO."public"."incentive_applications" (CDC-replicated) to enrich with INCENTIVE_AMOUNT and STATUS. Use latest application per vehicle match (ROW_NUMBER partitioned by MAKE, MODEL, APPLICANT_ZIP ordered by UPDATED_AT DESC, keep rn=1). Join condition: UPPER(bronze.MAKE) = UPPER(cdc.MAKE) AND UPPER(bronze.MODEL) = UPPER(cdc.MODEL) AND bronze.POSTAL_CODE = cdc.APPLICANT_ZIP.
+8. LEFT JOIN to EV_DEMO."public"."incentive_applications" (CDC-replicated) to enrich with INCENTIVE_AMOUNT and STATUS. Use latest application per VIN (ROW_NUMBER partitioned by VIN ordered by UPDATED_AT DESC, keep rn=1). Join condition: bronze.VIN = cdc.VIN.
 
 IMPORTANT — CDC table column naming:
 The Snowflake Connector for PostgreSQL replicates columns as UPPERCASE unquoted identifiers.
 The TABLE and SCHEMA names remain lowercase-quoted: EV_DEMO."public"."incentive_applications"
-But COLUMN names are standard uppercase: MAKE, MODEL, APPLICANT_ZIP, INCENTIVE_AMOUNT, STATUS, UPDATED_AT.
+But COLUMN names are standard uppercase: VIN, MAKE, MODEL, APPLICANT_ZIP, INCENTIVE_AMOUNT, STATUS, UPDATED_AT.
 Do NOT quote column names in lowercase — that will cause "invalid identifier" errors.
 
 Also create a Dynamic Table EV_DEMO.CLEAN.QUARANTINE_EV_REGISTRATIONS (same source, same lag) capturing rejected rows with a REJECTION_REASON column explaining why each row failed.
@@ -603,7 +605,7 @@ The semantic view YAML cannot be deployed via raw SQL or reliably via the CoCo s
    - `EV_DEMO.MART.AGG_REGISTRATIONS_BY_COUNTY`
    - `EV_DEMO."public"."incentive_applications"` (CDC table)
 5. The wizard auto-detects columns — mark dimensions, metrics, and relationships:
-   - **Relationships:** FACT.VIN → DIM_VEHICLE.VIN, FACT.GEO_KEY → DIM_GEOGRAPHY.GEO_KEY
+   - **Relationships:** FACT.VIN → DIM_VEHICLE.VIN, FACT.GEO_KEY → DIM_GEOGRAPHY.GEO_KEY, FACT.VIN → incentive_applications.VIN
    - **Key metrics:** COUNT(VIN) as registration_count, AVG(ELECTRIC_RANGE), approval_rate, etc.
    - Use `semantic/ev_registrations.yaml` as a reference for column descriptions and verified queries
 6. Save and verify: `SHOW SEMANTIC VIEWS IN SCHEMA EV_DEMO.MART;`

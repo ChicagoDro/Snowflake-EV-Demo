@@ -25,7 +25,8 @@
   CDC TABLE NOTE:
   EV_DEMO."public"."incentive_applications" — table/schema names are lowercase-quoted
   (PostgreSQL convention), but COLUMN names are standard UPPERCASE unquoted identifiers
-  in Snowflake: MAKE, MODEL, APPLICANT_ZIP, INCENTIVE_AMOUNT, STATUS, UPDATED_AT.
+  in Snowflake: VIN, MAKE, MODEL, APPLICANT_ZIP, INCENTIVE_AMOUNT, STATUS, UPDATED_AT.
+  Join to registrations is on VIN (deterministic 1:1 match).
 =============================================================================*/
 
 USE ROLE ACCOUNTADMIN;
@@ -67,16 +68,14 @@ validated AS (
       AND (ELECTRIC_RANGE >= 0 OR ELECTRIC_RANGE IS NULL)
 ),
 latest_incentive AS (
-    -- Get the most recent incentive application per make/model/zip combination.
+    -- Get the most recent incentive application per VIN.
     -- Column names are UPPERCASE unquoted (Snowflake connector convention).
     SELECT
-        UPPER(MAKE) AS INC_MAKE,
-        UPPER(MODEL) AS INC_MODEL,
-        APPLICANT_ZIP AS INC_ZIP,
+        VIN AS INC_VIN,
         INCENTIVE_AMOUNT,
         STATUS AS APPLICATION_STATUS,
         ROW_NUMBER() OVER (
-            PARTITION BY UPPER(MAKE), UPPER(MODEL), APPLICANT_ZIP
+            PARTITION BY VIN
             ORDER BY UPDATED_AT DESC
         ) AS rn
     FROM EV_DEMO."public"."incentive_applications"
@@ -130,11 +129,9 @@ LEFT JOIN EV_DEMO.RAW.STATE_EV_GOALS g
     ON v.STATE = g.STATE
     AND v.MODEL_YEAR = g.YEAR
 
--- Join to latest incentive application per vehicle match
+-- Join to latest incentive application by VIN (deterministic 1:1)
 LEFT JOIN latest_incentive i
-    ON UPPER(v.MAKE) = i.INC_MAKE
-    AND UPPER(v.MODEL) = i.INC_MODEL
-    AND CAST(v.POSTAL_CODE AS VARCHAR(10)) = i.INC_ZIP
+    ON v.VIN = i.INC_VIN
     AND i.rn = 1;
 
 -- ─────────────────────────────────────────────────────────────────────────────

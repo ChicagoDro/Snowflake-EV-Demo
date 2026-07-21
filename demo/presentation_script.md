@@ -49,9 +49,11 @@
                                               ↓
   [SQL Seeds] ────────────────────→ EV_DEMO.RAW (Reference)
                                               ↓
-                              Silver (Dynamic Tables) ← joins all sources
+                    Task Graph: INGEST → PARSE → QUALITY_CHECK
                                               ↓
-                              Gold (Dynamic Iceberg Tables on Azure Blob)
+                              Silver (Dynamic Tables, TARGET_LAG=60min) ← joins all sources
+                                              ↓
+                              Gold (Dynamic Iceberg Tables, TARGET_LAG=120min)
                                               ↓
                     ┌─────────────────────────────────────────────┐
                     │  Semantic View → Cortex Agent → Streamlit   │
@@ -78,8 +80,10 @@
 
 ### Slide 5: Orchestration Approach
 - **Event-driven:** Directory Table Stream detects new files on stage
-- **Task graph:** TASK_INGEST_RAW → TASK_PARSE_BRONZE → (Dynamic Tables auto-refresh)
-- **Error handling:** Task logs failures to OBS.TASK_RUN_LOG; DMFs fire alerts on quality breach
+- **Task graph:** TASK_INGEST_RAW → TASK_PARSE_BRONZE → TASK_QUALITY_CHECK → (Dynamic Tables auto-refresh Silver/Gold)
+- **Schedule:** CRON every 6 hours (0 */6 * * *), but only executes if stream has data
+- **Circuit breaker:** SUSPEND_TASK_AFTER_NUM_FAILURES = 3 on root task (children inherit)
+- **Error handling:** Task logs failures to OBS.TASK_RUN_LOG via SP_LOG_TASK_RUN; DMFs fire alerts on quality breach
 - **Comparison to Airflow:** No external scheduler to maintain; native Snowflake retry/dependency handling
 - **Dynamic Tables vs. Tasks for Silver/Gold:** "I let Snowflake decide when to refresh based on data staleness, not a cron"
 
@@ -106,6 +110,7 @@
 ### 1a. Bronze Layer — Ingestion & Parsing (5 min)
 - Open `demo/demo_verification_queries.sql` in Snowsight
 - Run BRONZE section: show raw VARIANT record, then parsed table
+- Show the Snowpark procedure source: `pipeline/sp_parse_ev_registrations.py`
 
 **Say:** "Bronze is our immutable, auditable landing zone. Raw JSON with load timestamp and source filename — we never transform in place. The Snowpark procedure reads column metadata from the JSON itself and maps dynamically. If the state adds a field to their export, the procedure adapts without code changes."
 
@@ -148,7 +153,9 @@
 > all layers immediately. Dynamic Tables have TARGET_LAG of 60-120 minutes — the force
 > script bypasses the wait so you can show fresh data in real-time during the demo.
 
-**Say:** "The pipeline is event-driven: a Directory Table Stream watches the stage for new files. When a file lands, TASK_INGEST_RAW fires, then TASK_PARSE_BRONZE runs after it completes. Dynamic Tables handle Silver and Gold refresh on their own."
+**Say:** "The pipeline is event-driven: a Directory Table Stream watches the stage for new files. When a file lands, TASK_INGEST_RAW fires, then TASK_PARSE_BRONZE runs, then TASK_QUALITY_CHECK verifies DMF thresholds. Dynamic Tables handle Silver and Gold refresh on their own."
+
+**Say:** "The root task has a circuit breaker — SUSPEND_TASK_AFTER_NUM_FAILURES = 3. If something goes wrong three times in a row, the whole graph suspends so it doesn't burn credits on repeated failures."
 
 **Say:** "Compared to Airflow: no external scheduler to deploy, no DAG code to maintain, no separate monitoring. Everything is native, observable in Snowsight, and costs nothing when idle."
 
@@ -164,14 +171,16 @@
 ## Demo Part 2: Semantic Model & Conversational Analytics (15 min)
 
 ### 2a. Semantic View Design (3 min)
-- Show `semantic/ev_registrations.yaml` (or describe the structure)
+- Show `semantic/ev_registrations.yaml` in the Workspace editor
+- Point out: 6 tables (4 Gold + 1 CDC + relationships), verified queries, measures, time dimensions
 
 **Say:** "The semantic view sits on top of Gold and the CDC table. It defines business-friendly names, metrics, time grains, and relationships. This is what enables natural language queries without the user knowing SQL or table structures."
 
-**Say:** "I designed it to cover three personas: executives asking about goal progress, marketing asking about market share, and operations asking about incentive program effectiveness."
+**Say:** "I included 8 verified queries — these are curated SQL that the agent uses as examples. They cover the key personas: executives asking about goal progress, marketing asking about market share, and operations asking about incentive program effectiveness."
 
 ### 2b. Cortex Agent Demo (7 min)
-- Open Streamlit app → Tab 2 (Chat)
+- Open Streamlit app (`streamlit/ev_insights_app.py`) → Tab 2 ("Ask the Data")
+- Agent FQN: `EV_DEMO.MART.EV_DEMO_ANALYST`
 - Ask these questions in sequence:
 
 1. **"How are we tracking against the 2030 goal?"**
@@ -191,8 +200,13 @@
    - **Say:** "Multi-turn context. The agent remembers what 'that' refers to and drills deeper."
 
 ### 2c. Streamlit Dashboard Tab (3 min)
-- Switch to Tab 1 (Executive Dashboard)
-- Walk through the 5 visualizations briefly
+- Switch to Tab 1 ("Executive Dashboard")
+- Walk through the 5 visualizations:
+  1. EV Adoption Trend (cumulative registrations vs. 2030 target line)
+  2. Geographic Distribution (top 15 counties bar + per-capita overlay)
+  3. Make/Model Leaderboard (top 10 makes + avg electric range)
+  4. CAFV Eligibility Breakdown (donut chart)
+  5. Incentive Program Status (metric cards: total apps, approval rate, pending backlog, $ disbursed)
 
 **Say:** "Tab 1 is the static dashboard for executives who want at-a-glance metrics. Tab 2 is the conversational interface for ad-hoc exploration. Same data, two consumption patterns — one for boards, one for analysts."
 
@@ -210,7 +224,7 @@
 ### Likely Questions & Answers
 
 **"Why Dynamic Tables instead of dbt models with Tasks?"**
-→ "For Silver/Gold, the refresh logic is pure SQL joins and aggregations — no testing framework needed at that layer. Dynamic Tables eliminate scheduling code entirely. I'd use dbt if I had a large analytics engineering team managing hundreds of models, needed dbt's built-in testing framework (unique, not_null, accepted_values), required Jinja templating for complex conditional logic, or needed cross-warehouse portability (BigQuery, Redshift). For this pipeline — small team, Snowflake-native, declarative refresh — Dynamic Tables are simpler and require no external tooling."
+→ "For Silver/Gold, the refresh logic is pure SQL joins and aggregations — no testing framework needed at that layer. Dynamic Tables eliminate scheduling code entirely. Silver has a TARGET_LAG of 60 minutes, Gold has 120 minutes — Snowflake decides when to recompute. I'd use dbt if I had a large analytics engineering team managing hundreds of models, needed dbt's built-in testing framework (unique, not_null, accepted_values), required Jinja templating for complex conditional logic, or needed cross-warehouse portability (BigQuery, Redshift). For this pipeline — small team, Snowflake-native, declarative refresh — Dynamic Tables are simpler and require no external tooling."
 
 **"Why not Snowpipe instead of COPY INTO + Tasks?"**
 → "The data arrives in daily/weekly batches, not a continuous stream. Snowpipe adds always-on cost for a low-frequency feed. Stream + Task is event-driven and costs nothing when no files arrive."
@@ -225,10 +239,10 @@
 → "Similar outcome, different operational model. With Snowflake: no cluster management, no Spark tuning, no Delta maintenance. The trade-off is Snowflake's pricing model vs. bring-your-own-compute economics. For a state agency without a platform team, managed wins. The Iceberg Gold layer gives them an exit path if they ever want external compute."
 
 **"What would you change in production?"**
-→ "OpenFlow instead of legacy connector. Snowpipe Streaming if data cadence increases. Resource monitors with budgets. Network policies. MFA enforcement. Marketplace listing instead of direct SHARE. A Cortex Agent with guardrails and audit logging."
+→ "OpenFlow instead of legacy connector. Snowpipe Streaming if data cadence increases. Resource monitors with budgets. Network policies. MFA enforcement. Marketplace listing instead of direct SHARE. A Cortex Agent with guardrails and audit logging. I'd also tighten the DMF schedules and add alerting via notification integrations."
 
 **"How did you use Cortex Code?"**
-→ "Every component was generated iteratively. The README is the build log — each prompt specifies intent, CoCo generates implementation, I review and refine. The CDC connector debugging is a great example: CoCo helped diagnose Spring Boot errors from container logs and iterated through config issues until the agent connected."
+→ "Every component was generated iteratively in a Snowflake Workspace. The semantic view, agent spec, Streamlit app, Snowpark procedure, Dynamic Tables, orchestration — all built in conversation with CoCo. The CDC connector debugging is a great example: CoCo helped diagnose Spring Boot errors from container logs and iterated through config issues until the agent connected."
 
 ---
 

@@ -86,5 +86,5 @@ SHOW AGENTS IN SCHEMA EV_DEMO.MART;
 -- Test the agent (returns JSON response with generated SQL + results)
 SELECT SNOWFLAKE.CORTEX.DATA_AGENT_RUN(
     'EV_DEMO.MART.EV_DEMO_ANALYST',
-    '{"messages": [{"role": "user", "content": [{"type": "text", "text": "How many total EV registrations do we have?"}]}]}'
+    '{"messages": [{"role": "sysadmin", "content": [{"type": "text", "text": "How many total EV registrations do we have?"}]}]}'
 ) AS agent_response;

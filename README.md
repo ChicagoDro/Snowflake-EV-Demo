@@ -465,14 +465,18 @@ Build data quality monitoring in EV_DEMO.OBS using Snowflake Data Metric Functio
 3. Attach DMFs to the Silver and Quarantine tables using ALTER TABLE ... SET DATA_METRIC_SCHEDULE.
    NOTE: Dynamic Tables and Dynamic Iceberg Tables support DMFs. Attach to Silver (CLEAN schema).
 
-4. Create a view OBS.V_DATA_QUALITY_DASHBOARD that queries SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS to surface all DMF results in one place.
+4. Create a DIY results table (OBS.DMF_RESULTS) and a stored procedure (OBS.SP_EVALUATE_DMFS) that calls each DMF manually and inserts results. This works on all editions (SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS requires Enterprise Edition).
+
+5. Create a scheduled task (OBS.TASK_EVALUATE_DMFS) to run the evaluation hourly.
+
+6. Create a view OBS.V_DATA_QUALITY_DASHBOARD that queries OBS.DMF_RESULTS to surface all DMF results with PASS/WARN/FAIL status.
 
 5. Create a notification integration and an ALERT that fires when any quality metric breaches its threshold.
 
 IMPORTANT — DMF limitations:
 - DMF expressions MUST be deterministic. Do NOT use CURRENT_TIMESTAMP(), CURRENT_DATE(), or any non-deterministic function inside a DMF body. This will cause: "Data metric function body cannot refer to the non-deterministic function..."
 - For freshness/staleness checks, use the built-in SNOWFLAKE.CORE.FRESHNESS system DMF instead.
-- DMFs require Enterprise Edition and the EXECUTE DATA METRIC FUNCTION account privilege.
+- DMFs can be attached on all editions, but SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS (scheduled result storage) requires Enterprise Edition. Use the DIY approach (SP_EVALUATE_DMFS + DMF_RESULTS table) for Standard/Trial accounts.
 - DATA_METRIC_SCHEDULE valid intervals are ONLY: 5, 15, 30, 60, 720, 1440 MINUTES (plural), 'TRIGGER_ON_CHANGES', or 'USING CRON ...'. Other values like 120 or 360 MINUTES are INVALID.
 - INFORMATION_SCHEMA table functions must be qualified with the database name: TABLE(EV_DEMO.INFORMATION_SCHEMA.DATA_METRIC_FUNCTION_REFERENCES(...)), not TABLE(INFORMATION_SCHEMA.DATA_METRIC_FUNCTION_REFERENCES(...)).
 - ALLOWED_RECIPIENTS in notification integrations must use validated emails belonging to users in the account. Use: norm@tamisin.com
@@ -626,23 +630,24 @@ Build a Streamlit app in Snowflake (Streamlit in Snowflake / SiS) with two tabs:
 4. CAFV Eligibility Breakdown — pie/donut chart showing proportion of vehicles eligible for clean fuel incentives.
 5. Incentive Program Status — summary cards showing total applications, approval rate, pending backlog, total incentive $ disbursed (from CDC data).
 
-**Tab 2: Ask the Data (Cortex Agent Chat)** — conversational interface:
-- Use the EV_DEMO_ANALYST Cortex Agent (created in Prompt 13)
-- Streamlit chat UI with st.chat_message / st.chat_input
-- Display agent responses including generated SQL and result tables
-- Include 3-4 suggested starter questions as clickable chips
-- Support multi-turn conversation (maintain message history)
+**Tab 2: Data Quality & Pipeline Health** — operational monitoring dashboard:
+- **DMF Metrics Panel**: Query EV_DEMO.OBS.DMF_RESULTS (DIY table populated by SP_EVALUATE_DMFS) and display:
+  - Current status of each DMF (PASS/WARN/FAIL) with color-coded indicators
+  - Metric values over time (line chart showing DMF_VIN_COMPLETENESS, DMF_DUPLICATE_VIN_COUNT, FRESHNESS, DMF_INVALID_BUSINESS_RULES, DMF_ROW_COUNT_RECONCILIATION)
+  - Last evaluation timestamp for each metric
+- **Pipeline Data Flow Panel**: Single-row scalar query showing row counts (RAW, BRONZE_PARSED, BRONZE_DISTINCT_VINS, SILVER, QUARANTINE, SILVER+QUARANTINE, GOLD_FACT) displayed as metric cards with PASS/INVESTIGATE reconciliation status.
+- **Ingested Files Panel**: Shows all files loaded into RAW_EV_REGISTRATIONS with their load timestamps, ordered by most recent first.
 
 Requirements:
 - Query Gold Iceberg tables for Tab 1
-- Use Cortex Agent API (snowflake.cortex.data_agent_run) for Tab 2
-- Use st.connection("snowflake") for the session
+- Use get_active_session() for the Snowpark session
 - Include a title, brief narrative text explaining each insight for a legislative audience
 - Use Altair or Plotly for charts (not matplotlib)
+- Handle cases where DMF_RESULTS table is empty (show "No DMF results yet" message)
 
 Save the Streamlit app to streamlit/ev_insights_app.py in Snowflake-EV-Demo
 ```
-**CoCo Output:** Streamlit insights + chat app **streamlit/ev_insights_app.py**
+**CoCo Output:** Streamlit insights app **streamlit/ev_insights_app.py**
 
 #### Manual Step: Deploy Streamlit App
 

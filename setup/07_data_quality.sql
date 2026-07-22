@@ -8,7 +8,8 @@
   WHY DMFs?
   • Native to Snowflake — no external tools (Great Expectations, dbt tests)
   • Serverless compute — runs on schedule without a warehouse
-  • Results queryable from SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS
+  • Results stored in EV_DEMO.OBS.DMF_RESULTS (DIY approach — works on all editions)
+  • Enterprise Edition users can also access SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS
   • Integrated with Snowflake alerting for threshold breaches
 
   DMF STRATEGY:
@@ -141,9 +142,75 @@ ALTER TABLE EV_DEMO.CLEAN.QUARANTINE_EV_REGISTRATIONS
     ADD DATA METRIC FUNCTION EV_DEMO.OBS.DMF_VIN_COMPLETENESS ON (VIN);
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 4. DATA QUALITY DASHBOARD VIEW
---    Single pane of glass for all DMF results.
+-- 4. DIY DMF RESULTS TABLE + EVALUATION PROCEDURE
+--    SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS requires Enterprise Edition.
+--    This DIY approach stores DMF results in a custom table and evaluates them
+--    via a stored procedure on a scheduled task — works on all editions.
 -- ═══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS EV_DEMO.OBS.DMF_RESULTS (
+    SCHEDULED_TIME TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
+    MEASUREMENT_TIME TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
+    TABLE_DATABASE VARCHAR DEFAULT 'EV_DEMO',
+    TABLE_SCHEMA VARCHAR,
+    TABLE_NAME VARCHAR,
+    METRIC_NAME VARCHAR,
+    VALUE NUMBER(38, 2)
+);
+
+CREATE OR REPLACE PROCEDURE EV_DEMO.OBS.SP_EVALUATE_DMFS()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+COMMENT = 'Evaluates all DMFs manually and inserts results into OBS.DMF_RESULTS. DIY replacement for Enterprise-only SNOWFLAKE.LOCAL.'
+AS
+BEGIN
+    -- DMF_VIN_COMPLETENESS on Silver
+    INSERT INTO EV_DEMO.OBS.DMF_RESULTS (TABLE_SCHEMA, TABLE_NAME, METRIC_NAME, VALUE)
+    SELECT 'CLEAN', 'SILVER_EV_REGISTRATIONS', 'DMF_VIN_COMPLETENESS',
+           EV_DEMO.OBS.DMF_VIN_COMPLETENESS(SELECT VIN FROM EV_DEMO.CLEAN.SILVER_EV_REGISTRATIONS);
+
+    -- DMF_DUPLICATE_VIN_COUNT on Silver
+    INSERT INTO EV_DEMO.OBS.DMF_RESULTS (TABLE_SCHEMA, TABLE_NAME, METRIC_NAME, VALUE)
+    SELECT 'CLEAN', 'SILVER_EV_REGISTRATIONS', 'DMF_DUPLICATE_VIN_COUNT',
+           EV_DEMO.OBS.DMF_DUPLICATE_VIN_COUNT(SELECT VIN FROM EV_DEMO.CLEAN.SILVER_EV_REGISTRATIONS);
+
+    -- DMF_INVALID_BUSINESS_RULES on Silver
+    INSERT INTO EV_DEMO.OBS.DMF_RESULTS (TABLE_SCHEMA, TABLE_NAME, METRIC_NAME, VALUE)
+    SELECT 'CLEAN', 'SILVER_EV_REGISTRATIONS', 'DMF_INVALID_BUSINESS_RULES',
+           EV_DEMO.OBS.DMF_INVALID_BUSINESS_RULES(SELECT EV_TYPE, ELECTRIC_RANGE FROM EV_DEMO.CLEAN.SILVER_EV_REGISTRATIONS);
+
+    -- DMF_ROW_COUNT_RECONCILIATION on Silver
+    INSERT INTO EV_DEMO.OBS.DMF_RESULTS (TABLE_SCHEMA, TABLE_NAME, METRIC_NAME, VALUE)
+    SELECT 'CLEAN', 'SILVER_EV_REGISTRATIONS', 'DMF_ROW_COUNT_RECONCILIATION',
+           EV_DEMO.OBS.DMF_ROW_COUNT_RECONCILIATION(SELECT VIN FROM EV_DEMO.CLEAN.SILVER_EV_REGISTRATIONS);
+
+    -- FRESHNESS on Silver
+    INSERT INTO EV_DEMO.OBS.DMF_RESULTS (TABLE_SCHEMA, TABLE_NAME, METRIC_NAME, VALUE)
+    SELECT 'CLEAN', 'SILVER_EV_REGISTRATIONS', 'FRESHNESS',
+           SNOWFLAKE.CORE.FRESHNESS(SELECT LOAD_TS FROM EV_DEMO.CLEAN.SILVER_EV_REGISTRATIONS);
+
+    -- DMF_VIN_COMPLETENESS on Quarantine
+    INSERT INTO EV_DEMO.OBS.DMF_RESULTS (TABLE_SCHEMA, TABLE_NAME, METRIC_NAME, VALUE)
+    SELECT 'CLEAN', 'QUARANTINE_EV_REGISTRATIONS', 'DMF_VIN_COMPLETENESS',
+           EV_DEMO.OBS.DMF_VIN_COMPLETENESS(SELECT VIN FROM EV_DEMO.CLEAN.QUARANTINE_EV_REGISTRATIONS);
+
+    RETURN 'DMF evaluation complete — ' || CURRENT_TIMESTAMP()::VARCHAR;
+END;
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- 5. SCHEDULED TASK + DASHBOARD VIEW
+--    Task runs hourly to populate DMF_RESULTS. View adds PASS/WARN/FAIL logic.
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+CREATE OR REPLACE TASK EV_DEMO.OBS.TASK_EVALUATE_DMFS
+    WAREHOUSE = WH_EV_DEMO
+    SCHEDULE = 'USING CRON 0 * * * * America/Los_Angeles'
+    COMMENT = 'Evaluates all DMFs hourly and stores results in OBS.DMF_RESULTS'
+AS
+    CALL EV_DEMO.OBS.SP_EVALUATE_DMFS();
+
+ALTER TASK EV_DEMO.OBS.TASK_EVALUATE_DMFS RESUME;
 
 CREATE OR REPLACE VIEW EV_DEMO.OBS.V_DATA_QUALITY_DASHBOARD AS
 SELECT
@@ -161,32 +228,29 @@ SELECT
         WHEN METRIC_NAME = 'DMF_ROW_COUNT_RECONCILIATION' AND VALUE != 0 THEN 'FAIL — row count mismatch'
         ELSE 'PASS'
     END AS QUALITY_STATUS
-FROM SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS
-WHERE TABLE_DATABASE = 'EV_DEMO'
+FROM EV_DEMO.OBS.DMF_RESULTS
 ORDER BY MEASUREMENT_TIME DESC;
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 5. ALERTING
+-- 6. ALERTING
 --    Fire an alert when any quality metric breaches its threshold.
 -- ═══════════════════════════════════════════════════════════════════════════════
 
--- Notification integration (email-based — uses current account user's email)
+-- Notification integration (email-based)
 -- NOTE: ALLOWED_RECIPIENTS must contain validated emails belonging to users in this account.
--- Replace with your actual Snowflake user email address.
 CREATE OR REPLACE NOTIFICATION INTEGRATION EV_DEMO_DQ_ALERTS
     TYPE = EMAIL
     ENABLED = TRUE
     ALLOWED_RECIPIENTS = ('norm@tamisin.com');
 
--- Alert: fires when any DMF indicates a failure
+-- Alert: fires when any DMF indicates a failure (checks last 2 hours of results)
 CREATE OR REPLACE ALERT EV_DEMO.OBS.ALERT_DATA_QUALITY_BREACH
     WAREHOUSE = WH_EV_DEMO
     SCHEDULE = 'USING CRON 0 */2 * * * America/Los_Angeles'
     IF (EXISTS (
         SELECT 1
-        FROM SNOWFLAKE.LOCAL.DATA_QUALITY_MONITORING_RESULTS
-        WHERE TABLE_DATABASE = 'EV_DEMO'
-          AND MEASUREMENT_TIME > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME()
+        FROM EV_DEMO.OBS.DMF_RESULTS
+        WHERE MEASUREMENT_TIME > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME()
           AND (
               (METRIC_NAME = 'DMF_DUPLICATE_VIN_COUNT' AND VALUE > 0)
               OR (METRIC_NAME = 'DMF_INVALID_BUSINESS_RULES' AND VALUE > 0)
@@ -206,16 +270,19 @@ CREATE OR REPLACE ALERT EV_DEMO.OBS.ALERT_DATA_QUALITY_BREACH
 ALTER ALERT EV_DEMO.OBS.ALERT_DATA_QUALITY_BREACH RESUME;
 
 -- ═══════════════════════════════════════════════════════════════════════════════
--- 6. VERIFY
---    Confirm DMFs are attached and scheduled.
+-- 7. RUN + VERIFY
+--    Execute immediately and confirm results.
 -- ═══════════════════════════════════════════════════════════════════════════════
 
--- Show all DMF associations on Silver (must qualify with database name)
+-- Run DMF evaluation now (don't wait for the hourly task)
+CALL EV_DEMO.OBS.SP_EVALUATE_DMFS();
+
+-- Show all DMF associations on Silver
 SELECT *
 FROM TABLE(EV_DEMO.INFORMATION_SCHEMA.DATA_METRIC_FUNCTION_REFERENCES(
     REF_ENTITY_NAME => 'EV_DEMO.CLEAN.SILVER_EV_REGISTRATIONS',
     REF_ENTITY_DOMAIN => 'TABLE'
 ));
 
--- Check the dashboard (will populate after first scheduled run)
+-- Check the dashboard (populated immediately via SP_EVALUATE_DMFS)
 SELECT * FROM EV_DEMO.OBS.V_DATA_QUALITY_DASHBOARD LIMIT 20;

@@ -24,6 +24,14 @@ USE ROLE ACCOUNTADMIN;
 USE WAREHOUSE WH_EV_DEMO;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- STEP 0: POSTGRESQL REPLICATION (automatic)
+--    The connector syncs on its configured schedule (every 6 hours via
+--    ENABLE_SCHEDULED_REPLICATION). There is no public "force sync" API.
+--    If you just updated PostgreSQL data, wait for the next scheduled sync
+--    or check: SELECT * FROM SNOWFLAKE_CONNECTOR_FOR_POSTGRESQL.PUBLIC.REPLICATION_STATE;
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- STEP 1: INGEST + PARSE (Bronze layer)
 --    In production, the Task graph handles this automatically.
 --    For demo, we run the COPY INTO and parse procedure directly.
@@ -83,6 +91,7 @@ ALTER DYNAMIC TABLE EV_DEMO.MART.FACT_EV_REGISTRATIONS REFRESH;
 ALTER DYNAMIC TABLE EV_DEMO.MART.AGG_REGISTRATIONS_BY_COUNTY REFRESH;
 ALTER DYNAMIC TABLE EV_DEMO.MART.AGG_REGISTRATIONS_BY_YEAR REFRESH;
 
+CALL EV_DEMO.OBS.SP_EVALUATE_DMFS();
 -- ─────────────────────────────────────────────────────────────────────────────
 -- STEP 4: VERIFY ROW COUNTS (confirm data flowed end-to-end)
 -- ─────────────────────────────────────────────────────────────────────────────

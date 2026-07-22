@@ -1,9 +1,8 @@
-# EV Insights Dashboard with Executive Analytics and Cortex Agent Chat
+# EV Insights Dashboard with Executive Analytics and Data Quality Monitoring
 # Co-authored with CoCo
 import streamlit as st
 import altair as alt
 import pandas as pd
-import json
 from snowflake.snowpark.context import get_active_session
 
 st.set_page_config(page_title="WA EV Insights", layout="wide")
@@ -11,7 +10,7 @@ st.title("Washington State EV Insights Dashboard")
 
 session = get_active_session()
 
-tab1, tab2 = st.tabs(["Executive Dashboard", "Ask the Data"])
+tab1, tab2 = st.tabs(["Executive Dashboard", "Data Quality & Pipeline Health"])
 
 # =============================================================================
 # TAB 1: Executive Dashboard
@@ -166,114 +165,125 @@ with tab1:
         c3.metric("Pending Backlog", f"{pending:,}")
         c4.metric("Total $ Disbursed", f"${disbursed:,.0f}")
     else:
-        st.info("No incentive application data available yet. CDC pipeline may not have captured application events.")
+        st.info("No incentive application data available yet.")
 
 # =============================================================================
-# TAB 2: Ask the Data (Cortex Agent Chat)
+# TAB 2: Data Quality & Pipeline Health
 # =============================================================================
 with tab2:
-    st.subheader("Ask the Data")
-    st.markdown(
-        "Chat with the **EV Demo Analyst** agent to explore EV registration data, "
-        "trends, and incentive programs using natural language."
-    )
+    st.subheader("Data Quality & Pipeline Health")
+    st.caption("Operational monitoring: DMF metrics, pipeline flow, replication status, and Dynamic Table health.")
 
-    AGENT_FQN = "EV_DEMO.MART.EV_DEMO_ANALYST"
+    if st.button("Refresh", key="refresh_dq"):
+        st.rerun()
 
-    # Starter questions
-    starter_questions = [
-        "What are the top 5 counties by EV registrations?",
-        "How has BEV adoption grown year over year?",
-        "Which EV makes have the longest electric range?",
-        "What percentage of EVs are eligible for clean fuel incentives?",
-    ]
+    # --- DMF Metrics Panel ---
+    st.markdown("### DMF Metrics")
+    try:
+        df_dmf = session.sql("""
+            SELECT SCHEDULED_TIME, MEASUREMENT_TIME, TABLE_SCHEMA, TABLE_NAME,
+                   METRIC_NAME, VALUE
+            FROM EV_DEMO.OBS.DMF_RESULTS
+            ORDER BY MEASUREMENT_TIME DESC
+        """).to_pandas()
 
-    st.markdown("**Suggested questions:**")
-    cols = st.columns(len(starter_questions))
-    for i, q in enumerate(starter_questions):
-        if cols[i].button(q, key=f"starter_{i}"):
-            st.session_state["pending_question"] = q
+        if not df_dmf.empty:
+            # Drop rows with NULL values (e.g., Quarantine with no data)
+            df_dmf = df_dmf.dropna(subset=["VALUE"])
 
-    # Message history
-    if "messages" not in st.session_state:
-        st.session_state["messages"] = []
+            # Current status for each metric (latest measurement)
+            latest = df_dmf.drop_duplicates(subset=["TABLE_NAME", "METRIC_NAME"], keep="first").copy()
+            latest["STATUS"] = latest.apply(lambda r: (
+                "FAIL" if (
+                    (r["METRIC_NAME"] == "DMF_DUPLICATE_VIN_COUNT" and r["VALUE"] > 0) or
+                    (r["METRIC_NAME"] == "DMF_INVALID_BUSINESS_RULES" and r["VALUE"] > 0) or
+                    (r["METRIC_NAME"] == "DMF_ROW_COUNT_RECONCILIATION" and r["VALUE"] != 0)
+                ) else "WARN" if (
+                    (r["METRIC_NAME"] == "DMF_VIN_COMPLETENESS" and r["VALUE"] < 100) or
+                    (r["METRIC_NAME"] == "FRESHNESS" and r["VALUE"] > 10800)
+                ) else "PASS"
+            ), axis=1)
 
-    # Display chat history
-    for msg in st.session_state["messages"]:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            # Color-coded status display
+            status_colors = {"PASS": "🟢", "WARN": "🟡", "FAIL": "🔴"}
+            latest["INDICATOR"] = latest["STATUS"].map(status_colors)
 
-    # Determine input
-    user_input = st.chat_input("Ask a question about EV data...")
-    if "pending_question" in st.session_state:
-        user_input = st.session_state.pop("pending_question")
+            display_cols = ["INDICATOR", "TABLE_NAME", "METRIC_NAME", "VALUE", "STATUS", "MEASUREMENT_TIME"]
+            st.dataframe(latest[display_cols], use_container_width=True)
 
-    if user_input:
-        st.session_state["messages"].append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.markdown(user_input)
+            # Trend chart
+            if len(df_dmf) > 1:
+                st.markdown("**Metric Values Over Time**")
+                trend_chart = alt.Chart(df_dmf).mark_line(point=True).encode(
+                    x=alt.X("MEASUREMENT_TIME:T", title="Time"),
+                    y=alt.Y("VALUE:Q", title="Value"),
+                    color=alt.Color("METRIC_NAME:N", title="Metric"),
+                    tooltip=["METRIC_NAME", "VALUE", "MEASUREMENT_TIME"]
+                ).properties(height=250)
+                st.altair_chart(trend_chart, use_container_width=True)
+        else:
+            st.info("DMF results exist but are empty for EV_DEMO.")
+    except Exception as e:
+        st.error(f"DMF query error: {str(e)}")
 
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    # Build messages payload for multi-turn
-                    api_messages = []
-                    for msg in st.session_state["messages"]:
-                        api_messages.append({
-                            "role": msg["role"],
-                            "content": [{"type": "text", "text": msg["content"]}]
-                        })
+    st.divider()
 
-                    request_body = json.dumps({"messages": api_messages})
+    # --- Pipeline Data Flow Panel ---
+    st.markdown("### Pipeline Data Flow")
+    try:
+        df_flow = session.sql("""
+            SELECT
+                (SELECT COUNT(*) FROM EV_DEMO.RAW.RAW_EV_REGISTRATIONS) AS RAW_VARIANT,
+                (SELECT COUNT(*) FROM EV_DEMO.RAW.BRONZE_PARSED) AS BRONZE_PARSED,
+                (SELECT COUNT(DISTINCT VIN) FROM EV_DEMO.RAW.BRONZE_PARSED) AS BRONZE_DISTINCT_VINS,
+                (SELECT COUNT(*) FROM EV_DEMO.CLEAN.SILVER_EV_REGISTRATIONS) AS SILVER,
+                (SELECT COUNT(*) FROM EV_DEMO.CLEAN.QUARANTINE_EV_REGISTRATIONS) AS QUARANTINE,
+                (SELECT COUNT(*) FROM EV_DEMO.CLEAN.SILVER_EV_REGISTRATIONS)
+                    + (SELECT COUNT(*) FROM EV_DEMO.CLEAN.QUARANTINE_EV_REGISTRATIONS) AS SILVER_PLUS_QUARANTINE,
+                (SELECT COUNT(*) FROM EV_DEMO.MART.FACT_EV_REGISTRATIONS) AS GOLD_FACT,
+                CASE
+                    WHEN (SELECT COUNT(DISTINCT VIN) FROM EV_DEMO.RAW.BRONZE_PARSED)
+                        = (SELECT COUNT(*) FROM EV_DEMO.CLEAN.SILVER_EV_REGISTRATIONS)
+                        + (SELECT COUNT(*) FROM EV_DEMO.CLEAN.QUARANTINE_EV_REGISTRATIONS)
+                    THEN 'PASS'
+                    ELSE 'INVESTIGATE'
+                END AS RECONCILIATION_STATUS
+        """).to_pandas()
 
-                    result = session.sql(f"""
-                        SELECT SNOWFLAKE.CORTEX.DATA_AGENT_RUN(
-                            '{AGENT_FQN}',
-                            PARSE_JSON('{request_body.replace("'", "''")}')
-                        ) AS RESPONSE
-                    """).collect()
+        if not df_flow.empty:
+            row = df_flow.iloc[0]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Raw Files", f"{int(row['RAW_VARIANT']):,}")
+            c2.metric("Bronze Parsed", f"{int(row['BRONZE_PARSED']):,}")
+            c3.metric("Silver", f"{int(row['SILVER']):,}")
+            c4.metric("Gold Fact", f"{int(row['GOLD_FACT']):,}")
 
-                    response_json = json.loads(result[0]["RESPONSE"])
+            c5, c6, c7 = st.columns(3)
+            c5.metric("Distinct VINs (Bronze)", f"{int(row['BRONZE_DISTINCT_VINS']):,}")
+            c6.metric("Silver + Quarantine", f"{int(row['SILVER_PLUS_QUARANTINE']):,}")
+            c7.metric("Quarantine", f"{int(row['QUARANTINE']):,}")
 
-                    # Extract text response
-                    assistant_text = ""
-                    sql_text = None
+            if row["RECONCILIATION_STATUS"] == "PASS":
+                st.success("PASS — all vehicles accounted for (dedup reduces raw rows to distinct VINs)")
+            else:
+                st.warning("INVESTIGATE — row count mismatch between Bronze distinct VINs and Silver + Quarantine")
+    except Exception as e:
+        st.error(f"Error querying pipeline flow: {str(e)}")
 
-                    if "choices" in response_json:
-                        for choice in response_json["choices"]:
-                            messages = choice.get("messages", [])
-                            for m in messages:
-                                if m.get("role") == "assistant":
-                                    for content_block in m.get("content", []):
-                                        if content_block.get("type") == "text":
-                                            assistant_text += content_block.get("text", "")
-                                        elif content_block.get("type") == "tool_results":
-                                            for tr in content_block.get("tool_results", []):
-                                                if tr.get("type") == "sql":
-                                                    sql_text = tr.get("statement", "")
-                    elif "message" in response_json:
-                        msg_content = response_json["message"].get("content", [])
-                        for block in msg_content:
-                            if block.get("type") == "text":
-                                assistant_text += block.get("text", "")
+    st.divider()
 
-                    if not assistant_text:
-                        assistant_text = "I received a response but couldn't extract text. Raw response available in logs."
+    # --- Ingested Files Panel ---
+    st.markdown("### Ingested Files")
+    try:
+        df_files = session.sql("""
+            SELECT SOURCE_FILE, LOADED_AT
+            FROM EV_DEMO.RAW.RAW_EV_REGISTRATIONS
+            ORDER BY LOADED_AT DESC
+        """).to_pandas()
 
-                    st.markdown(assistant_text)
-
-                    if sql_text:
-                        with st.expander("Generated SQL"):
-                            st.code(sql_text, language="sql")
-                        try:
-                            df_result = session.sql(sql_text).to_pandas()
-                            st.dataframe(df_result, use_container_width=True)
-                        except Exception:
-                            pass
-
-                    st.session_state["messages"].append({"role": "assistant", "content": assistant_text})
-
-                except Exception as e:
-                    error_msg = f"Error communicating with agent: {str(e)}"
-                    st.error(error_msg)
-                    st.session_state["messages"].append({"role": "assistant", "content": error_msg})
+        if not df_files.empty:
+            st.dataframe(df_files, use_container_width=True)
+        else:
+            st.info("No files ingested yet.")
+    except Exception as e:
+        st.error(f"Error querying ingested files: {str(e)}")

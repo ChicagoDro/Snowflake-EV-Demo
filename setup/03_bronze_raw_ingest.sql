@@ -30,8 +30,8 @@ LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
 PACKAGES = ('snowflake-snowpark-python')
 HANDLER = 'run'
-EXECUTE AS CALLER
 COMMENT = 'Parses Bronze VARIANT into typed BRONZE_PARSED. Uses meta.view.columns for runtime index mapping — no hardcoded positions.'
+EXECUTE AS CALLER
 AS
 $$
 """

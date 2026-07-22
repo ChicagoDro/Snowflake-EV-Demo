@@ -174,8 +174,6 @@ with tab2:
     st.subheader("Data Quality & Pipeline Health")
     st.caption("Operational monitoring: DMF metrics, pipeline flow, replication status, and Dynamic Table health.")
 
-    if st.button("Refresh", key="refresh_dq"):
-        st.rerun()
 
     # --- DMF Metrics Panel ---
     st.markdown("### DMF Metrics")
